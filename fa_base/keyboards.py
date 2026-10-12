@@ -35,8 +35,11 @@ def garants_nav(page, total_pages, cfg):
 
 def admin_menu():
     return inline(
-        [("📥 Жалобы на проверке", "admin:reports", False)],
-        [("💎 Гаранты", "admin:garants", False), ("🗂 Записи базы", "admin:records", False)],
-        [("🤝 Заявки на сделки", "admin:deals", False)],
-        [("📊 Статистика", "admin:stats", False)]
+        [("📥 Модерация жалоб", "admin:reports", False)],
+        [("💎 Управление гарантами", "admin:garants:0", False),
+         ("🗂 Записи базы", "admin:records:0", False)],
+        [("➕ Добавить гаранта", "admin:newgarant", False)],
+        [("🚫 Добавить мошенника", "admin:newrecord:scam", False),
+         ("⚠️ Сомнительные услуги", "admin:newrecord:suspicious", False)],
+        [("🤝 Сделки", "admin:deals", False), ("📊 Статистика", "admin:stats", False)]
     )
