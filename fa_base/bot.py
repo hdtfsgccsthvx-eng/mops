@@ -426,6 +426,69 @@ async def appeal(event: Message | CallbackQuery):
                    reply_markup=ik([("Отправить апелляцию", "url:" + cfg.appeal_url)]))
 
 
+async def admin_catalog(message: Message, category: str, page: int = 0):
+    """Telegram admin screen with paginated rows; IDs are hidden in callback data."""
+    page = max(0, min(page, 999))
+    model = Garant if category == "garants" else Record
+    prefix = "garant" if category == "garants" else "record"
+    async with Sessions() as s:
+        total = await count(s, model)
+        page = min(page, max(0, (total - 1) // 8))
+        items = list((await s.scalars(select(model).order_by(model.id.desc())
+                      .offset(page * 8).limit(8))).all())
+    rowset = []
+    for obj in items:
+        handle = obj.username or f"ID {obj.telegram_id}"
+        flag = "✅" if obj.active else "🚫"
+        label = f"{flag} #{obj.id} @{handle}"[:60]
+        rowset.append([(label, f"admin:{prefix}:{obj.id}")])
+    if not rowset:
+        rowset.append([("База пока пуста", "noop")])
+    total_pages = max(1, (total + 7) // 8)
+    nav = []
+    if page > 0:
+        nav.append(("◀️", f"admin:{category}:{page - 1}"))
+    nav.append((f"{page + 1}/{total_pages}", "noop"))
+    if page + 1 < total_pages:
+        nav.append(("▶️", f"admin:{category}:{page + 1}"))
+    rowset.append(nav)
+    rowset.append([("➕ Добавить гаранта" if category == "garants" else
+                   "🚫 Добавить мошенника",
+                   "admin:newgarant" if category == "garants" else "admin:newrecord:scam")])
+    if category == "records":
+        rowset.append([("⚠️ Сомнительная услуга", "admin:newrecord:suspicious")])
+    rowset.append([("⬅️ Админ-меню", "admin:home")])
+    title = "💎 <b>Управление гарантами</b>" if category == "garants" else "🗂 <b>Записи базы</b>"
+    await message.answer(f"{title}\nВыберите запись для просмотра или изменения статуса. "
+                         f"Всего: {total}", reply_markup=ik(*rowset))
+
+
+async def admin_report_index(message: Message, page: int = 0):
+    page = max(0, min(page, 999))
+    async with Sessions() as s:
+        total = await count(s, Report)
+        page = min(page, max(0, (total - 1) // 8))
+        items = list((await s.scalars(select(Report).order_by(Report.id.desc())
+                      .offset(page * 8).limit(8))).all())
+    icons = {"pending":"⏳", "approved":"✅", "rejected":"❌", "withdrawn":"↪"}
+    rows = [[(f"{icons.get(r.status,'📨')} #{r.id} @{r.target_username}"[:60],
+              f"admin:report:{r.id}")] for r in items]
+    if not rows:
+        rows = [[("Жалоб пока нет", "noop")]]
+    total_pages = max(1, (total + 7) // 8)
+    nav = []
+    if page:
+        nav.append(("◀️", f"admin:reports:{page-1}"))
+    nav.append((f"{page+1}/{total_pages}", "noop"))
+    if page+1 < total_pages:
+        nav.append(("▶️", f"admin:reports:{page+1}"))
+    rows += [nav, [("⬅️ Админ-меню", "admin:home")]]
+    await message.answer("📥 <b>Жалобы и решения</b>\n"
+                         "⏳ На проверке · ✅ Одобрена · ❌ Отклонена\n"
+                         "Нажмите на жалобу, чтобы подтвердить, отклонить или отменить решение.",
+                         reply_markup=ik(*rows))
+
+
 @router.message(Command("admin"))
 async def admin(message: Message):
     if not is_admin(message.from_user.id):
@@ -446,6 +509,83 @@ async def admin_callback(call: CallbackQuery, bot: Bot):
         return await call.answer("Нет доступа", show_alert=True)
     await call.answer()
     action = call.data.split(":")
+    if action[1] == "home":
+        return await call.message.answer("🛠 <b>FA база — управление</b>",
+                                         reply_markup=admin_menu())
+    if action[1] == "newgarant":
+        await state.clear()
+        await state.set_state(AddGarant.handle)
+        return await call.message.answer("💎 <b>Добавление / обновление гаранта</b>\n"
+                                         "Отправьте @username.", reply_markup=cancel_markup())
+    if action[1] == "newrecord" and len(action) == 3 and action[2] in KIND:
+        await state.clear()
+        await state.update_data(kind=action[2])
+        await state.set_state(AddRecord.target)
+        return await call.message.answer(f"➕ <b>{safe(KIND[action[2]])}</b>\n"
+                                         "Введите @username. Запись появится в базе после "
+                                         "добавления причины и доказательств.", reply_markup=cancel_markup())
+    if action[1] in ("garants", "records"):
+        page = int(action[2]) if len(action)>2 and action[2].isdigit() else 0
+        return await admin_catalog(call.message, action[1], page)
+    if action[1] == "reports":
+        page = int(action[2]) if len(action)>2 and action[2].isdigit() else 0
+        return await admin_report_index(call.message, page)
+    if action[1] in ("garant", "record") and len(action) == 3:
+        try:
+            ident = int(action[2])
+        except ValueError:
+            return await call.message.answer("Неверный ID.")
+        model = Garant if action[1] == "garant" else Record
+        async with Sessions() as s:
+            obj = await s.get(model, ident)
+            if not obj:
+                return await call.message.answer("Запись не найдена.")
+            handle, active = obj.username or str(getattr(obj,"telegram_id","")), obj.active
+            details = (f"Страна: {safe(obj.country)}\n"
+                       f"Комиссия: {safe(obj.fee)}\n"
+                       f"Канал: {safe(obj.channel_url or 'не указан')}\n"
+                       f"Описание: {safe(obj.description)}" if model is Garant else
+                       f"Категория: {safe(KIND.get(obj.kind, obj.kind))}\n"
+                       f"Причина: {safe(obj.reason)}\n"
+                       f"Доказательства: {safe(obj.evidence_url)}")
+        return await call.message.answer(
+             f"<b>#{ident} @{safe(handle)}</b>\n"
+             f"Статус: {'✅ Активна' if active else '🚫 Скрыта'}\n\n{details}",
+             reply_markup=ik([("🙈 Скрыть" if active else "♻️ Восстановить",
+                               f"admin:confirm:{action[1]}:{ident}:{int(not active)}")],
+                              [("⬅️ К списку", f"admin:{'garants' if model is Garant else 'records'}:0")]),
+             disable_web_page_preview=True)
+    if action[1] == "confirm" and len(action) == 5:
+        kind, idstr, value = action[2], action[3], action[4]
+        if kind not in ("garant", "record") or not idstr.isdigit() or value not in ("0", "1"):
+            return await call.message.answer("Неверная команда.")
+        return await call.message.answer(
+            f"Подтвердить {'восстановление' if value == '1' else 'скрытие'} "
+            f"{'гаранта' if kind == 'garant' else 'записи'} #{idstr}?",
+            reply_markup=ik([("✅ Да, применить", f"admin:toggle:{kind}:{idstr}:{value}")],
+                            [("↩️ Нет", f"admin:{kind}:{idstr}")]))
+    if action[1] == "toggle" and len(action) == 5:
+        kind, idstr, value = action[2], action[3], action[4]
+        if kind not in ("garant", "record") or not idstr.isdigit() or value not in ("0", "1"):
+            return await call.message.answer("Неверная команда.")
+        model = Garant if kind == "garant" else Record
+        async with Sessions() as s:
+            row = await s.get(model, int(idstr), with_for_update=True)
+            if not row:
+                return await call.message.answer("Запись не найдена.")
+            row.active = value == "1"
+            s.add(Audit(actor_id=call.from_user.id, action="admin_toggle",
+                        detail=f"{kind} #{row.id} active={row.active}"))
+            await s.commit()
+        try:
+            await call.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return await call.message.answer(
+            f"✅ {'Восстановлено' if value == '1' else 'Скрыто'}: "
+            f"{'гарант' if kind == 'garant' else 'запись'} #{idstr}.",
+            reply_markup=ik([("🔎 Открыть", f"admin:{kind}:{idstr}")],
+                            [("⬅️ К списку", f"admin:{'garants' if kind == 'garant' else 'records'}:0")]))
     async with Sessions() as s:
         if action[1] == "stats":
             return await call.message.answer("📊 <b>Статистика</b>\n"
