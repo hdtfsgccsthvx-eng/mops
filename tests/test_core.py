@@ -4,7 +4,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from fa_base.db import Base, Record, ReputationVote
-from fa_base.utils import username, evidence_url, parse_amount, get_admin_ids, safe, mention
+from fa_base.utils import username, evidence_url, parse_amount, parse_telegram_id, get_admin_ids, safe, mention
 
 class ValidatorsTest(unittest.TestCase):
     def test_usernames(self):
@@ -25,6 +25,12 @@ class ValidatorsTest(unittest.TestCase):
         for bad in ('49', '-5', '0', 'hello', '100000001', '99.50'):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 parse_amount(bad)
+
+    def test_telegram_id_validation(self):
+        self.assertEqual(parse_telegram_id('1874285560'), 1874285560)
+        for bad in ('0', '-1', 'abc', '1000000000000000000000000000'):
+            with self.subTest(value=bad), self.assertRaises(ValueError):
+                parse_telegram_id(bad)
 
     def test_admin_ids(self):
         self.assertEqual(get_admin_ids('1874285560, 8517242609;1874285560'),
