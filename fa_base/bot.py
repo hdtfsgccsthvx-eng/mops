@@ -24,7 +24,7 @@ from .db import (Audit, CheckEvent, Deal, Garant, Record, Report, Appeal, User, 
 from .keyboards import home_links, main_menu, admin_menu
 from .policies import (MAX_DEALS_PER_DAY, MAX_REPORTS_PER_DAY, identity_matches,
                        deal_status_text, can_cancel_deal, can_finish_deal)
-from .utils import evidence_url, mention, parse_amount, safe, username
+from .utils import evidence_url, mention, parse_amount, parse_telegram_id, safe, username
 from .branding import banner_path, avatar_path
 from .moderation import ModerationError, review_report
 from .appeals import AppealError, review_appeal, can_create_appeal
@@ -148,7 +148,7 @@ async def start(message: Message, command: CommandObject, state: FSMContext, bot
         return await appeal(message, state)
     if command.args and command.args.startswith("check_"):
         try:
-            checked_id = int(command.args[6:])
+            checked_id = parse_telegram_id(command.args[6:])
         except ValueError:
             return await message.answer("Неверная ссылка на профиль.")
         return await show_check(message, None, checked_id)
@@ -189,6 +189,11 @@ async def commands(message: Message):
 
 async def show_check(message: Message, requested: str | None, requested_id: int | None = None):
     async with Sessions() as s:
+        recent = await count(s, CheckEvent,
+                             CheckEvent.checker_id == message.from_user.id,
+                             CheckEvent.at >= datetime.now(timezone.utc)-timedelta(minutes=1))
+        if recent >= 20 and not is_admin(message.from_user.id):
+            return await message.answer("Слишком много проверок. Подождите минуту и попробуйте снова.")
         records = list((await s.scalars(select(Record).where(Record.active.is_(True), or_(Record.username == requested if requested else False,
                                              Record.telegram_id == requested_id if requested_id else False)).order_by(Record.created_at.desc()))).all())
         s.add(CheckEvent(checker_id=message.from_user.id, subject_username=requested, subject_id=requested_id))
@@ -249,9 +254,7 @@ async def vote_callback(call: CallbackQuery):
         if score is None or kind not in ("i", "u"):
             raise ValueError("Некорректная оценка")
         if kind == "i":
-            subject = int(ident)
-            if subject <= 0:
-                raise ValueError("Неверный ID")
+            subject = parse_telegram_id(ident)
             if subject == call.from_user.id:
                 return await call.answer("Нельзя оценивать себя", show_alert=True)
             key = f"id:{subject}"
@@ -284,9 +287,11 @@ async def check_cmd(message: Message, command: CommandObject):
     if not subject:
         return await message.answer("Введите: <code>/check @username</code>, ID пользователя или ответьте командой на его сообщение.")
     if subject.isdigit():
-        if int(subject) <= 0:
-            return await message.answer("Нужен положительный Telegram ID.")
-        return await show_check(message, None, int(subject))
+        try:
+            checked_id = parse_telegram_id(subject)
+        except ValueError as exc:
+            return await message.answer(safe(exc))
+        return await show_check(message, None, checked_id)
     try:
         u = username(subject)
     except ValueError as ex:
@@ -311,9 +316,10 @@ async def check_input(message: Message, state: FSMContext):
     if not raw:
         return await message.answer("Введите @username или Telegram ID.")
     if raw.isdecimal():
-        target_id = int(raw)
-        if target_id <= 0:
-            return await message.answer("Telegram ID должен быть положительным.")
+        try:
+            target_id = parse_telegram_id(raw)
+        except ValueError as exc:
+            return await message.answer(safe(exc))
         target, known_id = None, target_id
     else:
         try:
