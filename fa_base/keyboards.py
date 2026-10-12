@@ -40,7 +40,7 @@ def admin_menu():
     return inline(
         [("⏳ Новые жалобы", "admin:reports:0:pending", False),
          ("📝 Новые апелляции", "admin:appeals:0:pending", False)],
-        [("📋 Все жалобы", "admin:reports:0", False),
+        [("📋 Все жалобы", "admin:reports", False),
          ("📑 Все апелляции", "admin:appeals:0", False)],
         [("💎 Управление гарантами", "admin:garants:0", False),
          ("🗂 Записи базы", "admin:records:0", False)],
