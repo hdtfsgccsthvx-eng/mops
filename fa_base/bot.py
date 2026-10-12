@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from html import escape
 from urllib.parse import quote
 
@@ -22,6 +22,8 @@ from .config import Config
 from .db import (Audit, CheckEvent, Deal, Garant, Record, Report, User, ReputationVote,
                  audit, build_db, count, initialize, resolve_user, touch_user)
 from .keyboards import home_links, main_menu, admin_menu
+from .policies import (MAX_DEALS_PER_DAY, MAX_REPORTS_PER_DAY, identity_matches,
+                       deal_status_text, can_cancel_deal, can_finish_deal)
 from .utils import evidence_url, mention, parse_amount, safe, username
 
 log = logging.getLogger(__name__)
@@ -29,6 +31,8 @@ router = Router()
 cfg: Config
 Sessions = None
 BOT_NAME = ""
+BOT_READY = False
+BOT_ERROR = ""
 OWNER = "@mops_garant"
 KIND = {"scam": "Подтверждённая запись о мошенничестве", "suspicious": "Сомнительные услуги"}
 ASSETS = ("Деньги", "MM2", "Адопт", "Робуксы", "Blade Ball", "Grow Garden", "Другое")
@@ -324,6 +328,15 @@ async def cancel(event: Message | CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "report:start")
 @router.message(Command("report"))
 async def report_begin(event: Message | CallbackQuery, state: FSMContext):
+    actor_id = event.from_user.id
+    async with Sessions() as s:
+        recent = await count(s, Report, Report.author_id == actor_id,
+                             Report.created_at >= datetime.now(timezone.utc)-timedelta(days=1))
+    if recent >= MAX_REPORTS_PER_DAY:
+        if isinstance(event, CallbackQuery):
+            return await event.answer(f"Лимит: {MAX_REPORTS_PER_DAY} жалоб за 24 часа", show_alert=True)
+        return await event.answer(f"Лимит: {MAX_REPORTS_PER_DAY} жалоб за 24 часа")
+    await state.clear()
     await state.set_state(ReportForm.target)
     m = event.message if isinstance(event, CallbackQuery) else event
     if isinstance(event, CallbackQuery):
@@ -360,6 +373,11 @@ async def report_evidence(message: Message, state: FSMContext, bot: Bot):
         return await message.answer(safe(ex))
     d = await state.get_data()
     async with Sessions() as s:
+        recent = await count(s, Report, Report.author_id == message.from_user.id,
+                             Report.created_at >= datetime.now(timezone.utc)-timedelta(days=1))
+        if recent >= MAX_REPORTS_PER_DAY:
+            await state.clear()
+            return await message.answer("Лимит жалоб на сегодня достигнут. Попробуйте позже.")
         report = Report(author_id=message.from_user.id, target_username=d["target"], reason=d["reason"], evidence_url=evidence)
         s.add(report)
         await s.commit()
@@ -579,6 +597,11 @@ def asset_markup(prefix: str):
 @router.message(Command("deal"))
 async def deal_begin(message: Message, state: FSMContext, command: CommandObject):
     await state.clear()
+    async with Sessions() as s:
+        today = await count(s, Deal, Deal.creator_id == message.from_user.id,
+                            Deal.created_at >= datetime.now(timezone.utc)-timedelta(days=1))
+    if today >= MAX_DEALS_PER_DAY:
+        return await message.answer(f"Лимит: {MAX_DEALS_PER_DAY} новые сделки за 24 часа.")
     if command.args:
         try:
             target = username(command.args)
@@ -636,6 +659,11 @@ async def deal_amount(message: Message, state: FSMContext):
         return await message.answer(safe(ex))
     d = await state.get_data()
     async with Sessions() as s:
+        today = await count(s, Deal, Deal.creator_id == message.from_user.id,
+                            Deal.created_at >= datetime.now(timezone.utc)-timedelta(days=1))
+        if today >= MAX_DEALS_PER_DAY:
+            await state.clear()
+            return await message.answer("Лимит новых сделок на сегодня достигнут.")
         known = await resolve_user(s, d["target"])
         deal = Deal(creator_id=message.from_user.id, target_username=d["target"],
                     target_id=known.id if known else None, offered=d["offered"], requested=d["requested"], amount=amount,
@@ -663,10 +691,8 @@ async def invite_deal(message: Message, bot: Bot, deal_id: int):
         if caller.id == d.creator_id:
             return await message.answer("Это ваша сделка: перешлите ссылку другой стороне.")
         # The link may be forwarded; only named counterparty (or previously resolved ID) can accept.
-        if d.target_id and d.target_id != caller.id:
-            return await message.answer("Ссылка предназначена другому участнику.")
-        if not caller.username or caller.username.lower() != d.target_username:
-            return await message.answer(f"Ссылка адресована {mention(d.target_username)}. Войдите под соответствующим аккаунтом.")
+        if not identity_matches(d.target_id, d.target_username, caller.id, caller.username, d.creator_id):
+            return await message.answer(f"Ссылка адресована {mention(d.target_username)}. Проверьте аккаунт.")
         text = (f"🤝 <b>Предложение сделки #{d.id}</b>\n"
                 f"От участника <code>{d.creator_id}</code>\n"
                 f"Вы отдаёте: {safe(d.requested)}\nВы получаете: {safe(d.offered)}\n"
@@ -684,7 +710,8 @@ async def deal_answer(call: CallbackQuery, bot: Bot):
         d = await s.get(Deal, ident)
         if not d or d.status != "pending_target":
             return await call.answer("Сделка недоступна", show_alert=True)
-        if call.from_user.id == d.creator_id or (d.target_id and call.from_user.id != d.target_id) or (call.from_user.username or "").lower() != d.target_username:
+        if not identity_matches(d.target_id, d.target_username, call.from_user.id,
+                                call.from_user.username, d.creator_id):
             return await call.answer("Не ваш запрос", show_alert=True)
         d.target_id = call.from_user.id
         d.status = "declined" if reject else "accepted"
@@ -724,7 +751,7 @@ async def bind_group(message: Message, command: CommandObject, bot: Bot):
         link = (await bot.create_chat_invite_link(message.chat.id, member_limit=2)).invite_link
     except Exception:
         link = None
-    await message.answer(f"✅ Группа привязана к сделке #{did}.\nУчастники должны проверить все условия до передачи ценностей.")
+    await message.answer(f"✅ Группа привязана к сделке #{did}.\nУчастники должны проверить все условия до передачи ценностей.\n\nПо завершении модератор пишет /finishdeal {did}; в случае спора /disputedeal {did}.")
     if link:
         for uid in (creator, target):
             try:
@@ -771,7 +798,9 @@ dispatcher.include_router(router)
 
 
 async def run():
-    global cfg, Sessions, BOT_NAME
+    global cfg, Sessions, BOT_NAME, BOT_READY, BOT_ERROR
+    BOT_READY = False
+    BOT_ERROR = ""
     cfg = Config.load()
     engine, Sessions = build_db(cfg.database_url)
     await initialize(engine)
@@ -780,9 +809,15 @@ async def run():
         me = await bot.get_me()
         BOT_NAME = me.username
         await setup_commands(bot)
-        log.info("FA база запущен как @%s", BOT_NAME)
+        BOT_READY = True
+        print(f"FA база: Telegram bot @{BOT_NAME} ready for polling", flush=True)
         await dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types())
+    except Exception as exc:
+        BOT_ERROR = type(exc).__name__
+        print(f"FA база: Telegram polling error ({BOT_ERROR})", flush=True)
+        raise
     finally:
+        BOT_READY = False
         await bot.session.close()
         await engine.dispose()
 
