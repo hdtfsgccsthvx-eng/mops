@@ -113,10 +113,15 @@ def redirect(url):
 
 @app.get("/health")
 async def health():
+    from . import bot as bot_module
     configured = bool(os.getenv("BOT_TOKEN") and os.getenv("ADMIN_IDS"))
     running = bool(running_bot and not running_bot.done())
-    return {"status": "ok" if not configured or running else "degraded",
-            "bot_configured": configured, "bot_running": running}
+    ready = bool(running and bot_module.BOT_READY)
+    return {"status": "ok" if ready else "degraded",
+            "bot_configured": configured, "bot_running": running,
+            "bot_ready": ready,
+            "bot_username": bot_module.BOT_NAME if ready else None,
+            "bot_error": bot_module.BOT_ERROR or None}
 
 
 @app.get("/")
@@ -279,8 +284,33 @@ async def deals(request:Request):
     if not get_admin(request):return redirect('/admin/login')
     async with Sessions() as s:
         items=(await s.scalars(select(Deal).order_by(Deal.id.desc()).limit(200))).all()
-    trs=''.join(f'<tr><td>#{d.id}</td><td>{esc(d.creator_id)}</td><td>@{esc(d.target_username)}</td><td>{esc(d.offered)} → {esc(d.requested)}</td><td>{d.amount} ₽</td><td>{esc(d.status)}</td><td>{esc(d.group_chat_id or "—")}</td></tr>' for d in items)
-    return page('Сделки',f'<div class="card"><h2>Сделки</h2><p>Когда обе стороны подтвердили условия, администратор создаёт Telegram-группу, добавляет бота с правами приглашения и пишет <code>/binddeal ID</code>. Группу бот самостоятельно создать не может.</p><table><tr><th>ID</th><th>Автор</th><th>Контрагент</th><th>Обмен</th><th>Сумма</th><th>Статус</th><th>Группа</th></tr>{trs}</table></div>')
+    from .policies import can_finish_deal, deal_status_text
+    trs = ''
+    for d in items:
+        actions = ''
+        if can_finish_deal(d.status):
+            actions = (f'<form class="inline" method="post" action="/admin/deals/{d.id}/complete">{csrf_input()}<button>Завершить</button></form>'
+                       f'<form class="inline" method="post" action="/admin/deals/{d.id}/dispute">{csrf_input()}<button class="danger">Открыть спор</button></form>')
+        trs += (f'<tr><td>#{d.id}</td><td>{esc(d.creator_id)}</td><td>@{esc(d.target_username)}</td>'
+                f'<td>{esc(d.offered)} → {esc(d.requested)}</td><td>{d.amount} ₽</td>'
+                f'<td>{esc(deal_status_text(d.status))}</td><td>{esc(d.group_chat_id or "—")}</td><td>{actions}</td></tr>')
+    return page('Сделки',f'<div class="card"><h2>Сделки</h2><p>После подтверждения обеих сторон создайте группу, добавьте бота администратором и выполните <code>/binddeal ID</code>. Ни бот, ни администратор не удерживают платежи автоматически.</p><table><tr><th>ID</th><th>Автор</th><th>Контрагент</th><th>Обмен</th><th>Сумма</th><th>Статус</th><th>Группа</th><th>Управление</th></tr>{trs}</table></div>')
+
+
+@app.post('/admin/deals/{did}/{action}')
+async def review_deal(did:int, action:str, request:Request, csrf:str=Form()):
+    from .policies import can_finish_deal
+    check_csrf(request,csrf)
+    if action not in ('complete', 'dispute'):
+        raise HTTPException(404)
+    async with Sessions() as s:
+        d = await s.get(Deal,did)
+        if not d or not can_finish_deal(d.status):
+            raise HTTPException(409,'Сделка недоступна для изменения статуса')
+        d.status = 'completed' if action=='complete' else 'disputed'
+        s.add(Audit(actor_id=0,action='web_deal_status',detail=f'{did}:{d.status}'))
+        await s.commit()
+    return redirect('/admin/deals')
 
 
 if __name__ == '__main__':
