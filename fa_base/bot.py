@@ -25,7 +25,8 @@ from .keyboards import home_links, main_menu, admin_menu
 from .policies import (MAX_DEALS_PER_DAY, MAX_REPORTS_PER_DAY, identity_matches,
                        deal_status_text, can_cancel_deal, can_finish_deal)
 from .utils import evidence_url, mention, parse_amount, safe, username
-from .branding import banner_path, avatar_path
+from .branding import banner_path
+from .moderation import ModerationError, review_report, avatar_path
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -78,6 +79,17 @@ def is_admin(uid: int) -> bool:
 
 def cancel_markup():
     return ik([("✖ Отмена", "cancel")])
+
+
+def report_actions(report_id: int, status: str):
+    if status == "pending":
+        return ik([("✅ Подтвердить", f"admin:approve:{report_id}"),
+                   ("❌ Отклонить", f"admin:reject:{report_id}")],
+                  [("📋 Подробности", f"admin:report:{report_id}")])
+    if status in ("approved", "rejected"):
+        return ik([("↩️ Отменить решение", f"admin:reopen:{report_id}")],
+                  [("📋 Подробности", f"admin:report:{report_id}")])
+    return ik([("📋 Подробности", f"admin:report:{report_id}")])
 
 
 async def notify_admins(bot: Bot, text: str, markup=None):
@@ -401,7 +413,7 @@ async def report_evidence(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
     await message.answer(f"✅ Жалоба #{report_id} принята на модерацию. Она не появляется в публичной базе автоматически.")
     await notify_admins(bot, f"📨 <b>Новая жалоба #{report_id}</b>\nНа: {mention(d['target'])}\nПричина: {safe(d['reason'][:1000])}\nМатериалы: {safe(evidence)}",
-                        ik([("Открыть в админ-панели", f"admin:report:{report_id}")]))
+                        report_actions(report_id, "pending"))
 
 
 @router.callback_query(F.data == "appeal:start")
@@ -418,7 +430,13 @@ async def appeal(event: Message | CallbackQuery):
 async def admin(message: Message):
     if not is_admin(message.from_user.id):
         return await message.answer("Нет доступа к админ-панели.")
-    await message.answer("🛠 <b>FA база — админ-панель</b>\n\nКоманды: /add_garant, /add_sckam, /add_comn, /delete_record ID, /delete_garant ID, /binddeal ID (в группе), /finishdeal ID, /disputedeal ID.",
+    await message.answer("🛠 <b>FA база — админ-панель</b>\n\n"
+                         "📥 /reviewreport ID — открыть любую жалобу\n"
+                         "🗂 /reports — список последних жалоб\n"
+                         "💎 /add_garant, /add_sckam, /add_comn\n"
+                         "Скрыть запись: /delete_record ID\n"
+                         "Скрыть гаранта: /delete_garant ID\n"
+                         "Сделки: /binddeal ID, /finishdeal ID, /disputedeal ID.",
                          reply_markup=admin_menu())
 
 
@@ -438,34 +456,46 @@ async def admin_callback(call: CallbackQuery, bot: Bot):
                     f"Новых жалоб: {await count(s,Report,Report.status=='pending')}\n"
                     f"Сделок: {await count(s,Deal)}")
         if action[1] == "reports":
-            ids = list((await s.scalars(select(Report.id).where(Report.status == "pending").order_by(Report.id.desc()).limit(10))).all())
-            if not ids:
-                return await call.message.answer("Нет ожидающих жалоб.")
-            return await call.message.answer("📥 Жалобы на проверке", reply_markup=ik(*[[(f"Жалоба #{i}", f"admin:report:{i}")] for i in ids]))
+            rows = list((await s.scalars(select(Report).order_by(Report.id.desc()).limit(20))).all())
+            if not rows:
+                return await call.message.answer("Жалоб пока нет.")
+            titles = {"pending": "⏳", "approved": "✅", "rejected": "❌", "withdrawn": "↪"}
+            markup = ik(*[[(f"{titles.get(r.status, '📋')} Жалоба #{r.id}: @{r.target_username}", f"admin:report:{r.id}")] for r in rows])
+            return await call.message.answer("📥 <b>Жалобы и решения</b>\n"
+                                             "⏳ на рассмотрении · ✅ подтверждена · ❌ отклонена",
+                                             reply_markup=markup)
         if action[1] == "report" and len(action) == 3:
             r = await s.get(Report, int(action[2]))
             if not r:
                 return await call.message.answer("Жалоба не найдена.")
-            k = ik([("✅ Подтвердить", f"admin:approve:{r.id}")], [("❌ Отклонить", f"admin:reject:{r.id}")]) if r.status == "pending" else None
+            k = report_actions(r.id, r.status)
             return await call.message.answer(f"<b>Жалоба #{r.id}</b> ({safe(r.status)})\nНа: {mention(r.target_username)}\n"
                   f"От: <code>{r.author_id}</code>\nПричина: {safe(r.reason)}\nДоказательства: {safe(r.evidence_url)}", reply_markup=k)
-        if action[1] in ("approve", "reject") and len(action) == 3:
-            r = await s.get(Report, int(action[2]))
-            if not r or r.status != "pending":
-                return await call.message.answer("Жалоба уже рассмотрена или отсутствует.")
-            if action[1] == "approve":
-                s.add(Record(username=r.target_username, kind="scam", reason=r.reason, evidence_url=r.evidence_url, created_by=call.from_user.id))
-                r.status = "approved"
-            else:
-                r.status = "rejected"
-            r.reviewed_by = call.from_user.id
-            s.add(Audit(actor_id=call.from_user.id, action="review_report", detail=f"#{r.id}: {r.status}"))
-            await s.commit()
+        if action[1] in ("approve", "reject", "reopen") and len(action) == 3:
             try:
-                await bot.send_message(r.author_id, f"Жалоба #{r.id}: {'подтверждена модератором' if r.status=='approved' else 'отклонена после проверки'}.")
+                ident = int(action[2])
+                r = await review_report(s, ident, action[1], call.from_user.id)
+                await s.commit()
+                report_id, status, author_id = r.id, r.status, r.author_id
+            except (ModerationError, ValueError) as exc:
+                await s.rollback()
+                return await call.message.answer("⚠️ " + safe(str(exc)))
+            try:
+                await call.message.edit_reply_markup(reply_markup=report_actions(report_id, status))
             except Exception:
                 pass
-            return await call.message.answer(f"Жалоба #{r.id}: {safe(r.status)}")
+            status_labels = {"approved": "✅ Подтверждена и опубликована",
+                             "rejected": "❌ Отклонена", "pending": "↩️ Решение отменено; запись снята с публикации"}
+            await call.message.answer(f"Жалоба #{report_id}: {status_labels[status]}.",
+                                      reply_markup=report_actions(report_id, status))
+            try:
+                note = ("Решение модератора отменено. Жалоба снова рассматривается."
+                        if status == "pending" else
+                        ("Подтверждена модератором." if status == "approved" else "Отклонена после проверки."))
+                await bot.send_message(author_id, f"Жалоба #{report_id}: {note}")
+            except Exception:
+                pass
+            return
         if action[1] == "garants":
             gs = list((await s.scalars(select(Garant).order_by(Garant.id.desc()).limit(15))).all())
             text = "💎 Гаранты: \n" + "\n".join(f"#{g.id} @{safe(g.username)} ({'активен' if g.active else 'скрыт'})" for g in gs)
@@ -476,6 +506,55 @@ async def admin_callback(call: CallbackQuery, bot: Bot):
         if action[1] == "deals":
             ds = list((await s.scalars(select(Deal).order_by(Deal.id.desc()).limit(15))).all())
             return await call.message.answer("🤝 Сделки:\n" + "\n".join(f"#{d.id} @{safe(d.target_username)} {safe(d.status)}" for d in ds) + "\n\nЧтобы привязать группу, добавьте в неё бота с правами администратора и выполните /binddeal ID")
+
+
+@router.message(Command("reports"))
+async def admin_report_list(message: Message):
+    if not is_admin(message.from_user.id):
+        return await message.answer("Нет доступа.")
+    async with Sessions() as s:
+        rows = list((await s.scalars(select(Report).order_by(Report.id.desc()).limit(20))).all())
+    if not rows:
+        return await message.answer("Жалоб пока нет.")
+    icons = {"pending": "⏳", "approved": "✅", "rejected": "❌", "withdrawn": "↪"}
+    await message.answer("📥 <b>Последние жалобы</b>",
+        reply_markup=ik(*[[(f"{icons.get(r.status, '📋')} #{r.id} @{r.target_username}",
+                           f"admin:report:{r.id}")] for r in rows]))
+
+
+@router.message(Command("reviewreport"))
+async def admin_review_by_id(message: Message, command: CommandObject):
+    if not is_admin(message.from_user.id):
+        return await message.answer("Нет доступа.")
+    if not command.args or not command.args.strip().isdigit():
+        return await message.answer("Формат: /reviewreport 1")
+    async with Sessions() as s:
+        r = await s.get(Report, int(command.args.strip()))
+        if not r:
+            return await message.answer("Жалоба не найдена.")
+        content = (f"<b>Жалоба #{r.id}</b> ({safe(r.status)})\n"
+                   f"На: {mention(r.target_username)}\n"
+                   f"От: <code>{r.author_id}</code>\n"
+                   f"Причина: {safe(r.reason)}\n"
+                   f"Доказательства: {safe(r.evidence_url)}")
+        markup = report_actions(r.id, r.status)
+    await message.answer(content, reply_markup=markup, disable_web_page_preview=True)
+
+
+@router.message(Command("withdrawreport"))
+async def withdraw_own_report(message: Message, command: CommandObject, bot: Bot):
+    if not command.args or not command.args.strip().isdigit():
+        return await message.answer("Формат: /withdrawreport 1")
+    async with Sessions() as s:
+        try:
+            r = await review_report(s, int(command.args.strip()), "withdraw", message.from_user.id)
+            await s.commit()
+            ident = r.id
+        except ModerationError as exc:
+            await s.rollback()
+            return await message.answer("⚠️ " + safe(str(exc)))
+    await message.answer(f"✅ Жалоба #{ident} отозвана до рассмотрения.")
+    await notify_admins(bot, f"📋 Жалоба #{ident} отозвана автором.")
 
 
 @router.message(Command("add_garant"))
