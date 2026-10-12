@@ -19,7 +19,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import Config
-from .db import (Audit, CheckEvent, Deal, Garant, Record, Report, User,
+from .db import (Audit, CheckEvent, Deal, Garant, Record, Report, User, ReputationVote,
                  audit, build_db, count, initialize, resolve_user, touch_user)
 from .keyboards import home_links, main_menu, admin_menu
 from .utils import evidence_url, mention, parse_amount, safe, username
@@ -106,6 +106,14 @@ async def start(message: Message, command: CommandObject, state: FSMContext, bot
         except ValueError:
             return await message.answer("Неверная ссылка на профиль.")
         return await show_check(message, None, checked_id)
+    if command.args and command.args.startswith("checku_"):
+        try:
+            handle = username(command.args[7:])
+        except ValueError:
+            return await message.answer("Неверная ссылка на профиль.")
+        async with Sessions() as s:
+            found_user = await resolve_user(s, handle)
+        return await show_check(message, handle, found_user.id if found_user else None)
     if command.args and command.args.startswith("deal_"):
         try:
             deal_id = int(command.args[5:])
@@ -138,6 +146,9 @@ async def show_check(message: Message, requested: str | None, requested_id: int 
         await s.commit()
         total_checks = await count(s, CheckEvent, or_(CheckEvent.subject_username == requested if requested else False,
                                                      CheckEvent.subject_id == requested_id if requested_id else False))
+        key = f"id:{requested_id}" if requested_id is not None else f"username:{requested}"
+        positive = await count(s, ReputationVote, ReputationVote.subject_key == key, ReputationVote.score == 1)
+        negative = await count(s, ReputationVote, ReputationVote.subject_key == key, ReputationVote.score == -1)
         if requested_id is not None:
             user = await s.get(User, requested_id)
             if user and not requested:
@@ -157,14 +168,55 @@ async def show_check(message: Message, requested: str | None, requested_id: int 
     else:
         text += ("\n✅ <b>Активных записей не найдено.</b>\n"
                  "Это не подтверждение надёжности пользователя. Проверяйте условия сделки самостоятельно.\n")
+    text += (f"\n👍 Положительных оценок: {positive} | 👎 Предостережений: {negative}"
+             "\n<i>Оценки — мнение пользователей, не подтверждённые факты.</i>")
     text += f"\n🔍 Количество проверок: {total_checks}\n🗓 Проверено: {datetime.now(timezone.utc):%d.%m.%Y} (UTC)"
-    link = f"https://t.me/{BOT_NAME}?start=check_{requested_id}" if requested_id else ""
+    link = (f"https://t.me/{BOT_NAME}?start=check_{requested_id}" if requested_id
+            else f"https://t.me/{BOT_NAME}?start=checku_{requested}" if requested else "")
     rows = []
     if link:
-        rows.append([("🔗 Постоянная ссылка на ID", "url:" + link)])
+        rows.append([("🔗 " + ("Ссылка на Telegram ID" if requested_id else "Ссылка по username"), "url:" + link)])
+    if requested_id is not None or requested:
+        target = f"i:{requested_id}" if requested_id is not None else f"u:{requested}"
+        rows.append([("👍 Поддержать", f"vote:plus:{target}"),
+                     ("👎 Предостеречь", f"vote:minus:{target}")])
     rows.append([("📝 Подать апелляцию", "appeal:start")])
     rows.append([("⚠️ Сообщить о мошенничестве", "report:start")])
     await message.answer(text[:3900], reply_markup=ik(*rows), disable_web_page_preview=True)
+
+
+@router.callback_query(F.data.startswith("vote:"))
+async def vote_callback(call: CallbackQuery):
+    try:
+        _, val, kind, ident = call.data.split(":", 3)
+        score = 1 if val == "plus" else -1 if val == "minus" else None
+        if score is None or kind not in ("i", "u"):
+            raise ValueError("Некорректная оценка")
+        if kind == "i":
+            subject = int(ident)
+            if subject <= 0:
+                raise ValueError("Неверный ID")
+            if subject == call.from_user.id:
+                return await call.answer("Нельзя оценивать себя", show_alert=True)
+            key = f"id:{subject}"
+        else:
+            subject = username(ident)
+            if subject == (call.from_user.username or "").lower():
+                return await call.answer("Нельзя оценивать себя", show_alert=True)
+            key = f"username:{subject}"
+    except (ValueError, TypeError):
+        return await call.answer("Неверные данные", show_alert=True)
+    async with Sessions() as s:
+        vote = await s.scalar(select(ReputationVote).where(
+            ReputationVote.voter_id == call.from_user.id,
+            ReputationVote.subject_key == key))
+        if vote:
+            vote.score = score
+        else:
+            s.add(ReputationVote(voter_id=call.from_user.id,
+                                 subject_key=key, score=score))
+        await s.commit()
+    await call.answer("✅ Оценка сохранена. Обновите проверку, чтобы увидеть результат.", show_alert=True)
 
 
 @router.message(Command("check"))
@@ -694,8 +746,7 @@ async def text_menu(message: Message, state: FSMContext):
     if message.text == "🤝 Новая сделка":
         return await deal_begin(message, state, CommandObject(prefix='/',command='deal',args=None))
     if message.text == "⚠️ Сообщить о мошенничестве":
-        await message.answer("Для подачи жалобы используйте /report.")
-        return
+        return await report_begin(message, state)
     if message.text == "ℹ️ О проекте":
         return await info_cmd(message)
     if message.text == "📋 Команды":
