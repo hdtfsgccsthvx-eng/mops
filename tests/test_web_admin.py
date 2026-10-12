@@ -23,7 +23,7 @@ class DashboardIntegrationTest(unittest.TestCase):
         self.env.start()
         from fa_base import server
         self.server = importlib.reload(server)
-        self.client = TestClient(self.server.app, follow_redirects=False)
+        self.client = TestClient(self.server.app, follow_redirects=False, base_url="https://testserver")
         self.client.__enter__()
 
     def tearDown(self):
