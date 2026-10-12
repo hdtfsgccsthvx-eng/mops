@@ -74,3 +74,32 @@ def banner_path(kind: str = "welcome") -> str:
     d.text((453,483),"Владелец  @mops_garant",fill=(203,182,196,255),font=font(24,False))
     img.convert("RGB").save(path,format="PNG",optimize=True)
     return str(path)
+
+
+@lru_cache(maxsize=1)
+def avatar_path() -> str:
+    """Original square JPEG for the Telegram bot profile. Updated only once per version."""
+    root = Path("/tmp/fa-baza-covers")
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / "fa-avatar-v1.jpg"
+    if path.is_file():
+        return str(path)
+    size = 640
+    canvas = Image.new("RGB", (size, size), "#10101c")
+    base = ImageDraw.Draw(canvas)
+    for y in range(size):
+        blend = y / size
+        base.line([(0, y), (size, y)], fill=(25+int(20*blend), 12+int(5*blend), 30+int(15*blend)))
+    haze = Image.new("RGBA", (size, size), (0,0,0,0))
+    ImageDraw.Draw(haze).ellipse((-85,-155,725,715), fill=(244,74,117,60))
+    canvas = Image.alpha_composite(canvas.convert("RGBA"), haze.filter(ImageFilter.GaussianBlur(85)))
+    draw = ImageDraw.Draw(canvas)
+    pink = (246,84,126,255)
+    draw.rounded_rectangle((28,28,612,612), radius=95, outline=(255,87,129,150), width=6)
+    draw.polygon([(320,110),(483,160),(468,361),(320,496),(172,361),(157,160)],
+                 fill=(21,22,38,255), outline=pink, width=12)
+    draw.line([(240,295),(299,351),(409,239)], fill=pink, width=33, joint="curve")
+    draw.ellipse((285,340,313,368), fill=(255,244,247,255))
+    draw.text((320,533), "FA", fill=(255,248,250,255), font=font(64), anchor="mm")
+    canvas.convert("RGB").save(path, "JPEG", quality=93, subsampling=0)
+    return str(path)
