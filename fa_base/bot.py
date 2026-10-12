@@ -59,6 +59,10 @@ class AddGarant(StatesGroup):
     fee = State()
 
 
+class EditGarant(StatesGroup):
+    value = State()
+
+
 class DealForm(StatesGroup):
     target = State()
     offered = State()
@@ -506,149 +510,262 @@ async def admin(message: Message):
                          reply_markup=admin_menu())
 
 
+async def admin_render(call: CallbackQuery, text: str, markup=None):
+    """Keep navigation inside one message; fall back when the original is not editable."""
+    try:
+        await call.message.edit_text(text, reply_markup=markup, disable_web_page_preview=True)
+    except Exception:
+        await call.message.answer(text, reply_markup=markup, disable_web_page_preview=True)
+
+
+def back_admin(section: str = "home", page: int = 0):
+    return [("⬅️ Назад", "admin:home" if section == "home" else f"admin:{section}:{page}")]
+
+
 @router.callback_query(F.data.startswith("admin:"))
 async def admin_callback(call: CallbackQuery, bot: Bot, state: FSMContext):
     if not is_admin(call.from_user.id):
         return await call.answer("Нет доступа", show_alert=True)
     await call.answer()
-    action = call.data.split(":")
-    if action[1] == "home":
-        return await call.message.answer("🛠 <b>FA база — управление</b>",
-                                         reply_markup=admin_menu())
-    if action[1] == "newgarant":
+    a = call.data.split(":")
+    task = a[1] if len(a) > 1 else "home"
+
+    if task == "home":
+        return await admin_render(call, "🛠 <b>FA база — управление</b>\n"
+            "Выберите раздел. Все действия доступны кнопками.",
+            admin_menu())
+    if task == "newgarant":
         await state.clear()
         await state.set_state(AddGarant.handle)
-        return await call.message.answer("💎 <b>Добавление / обновление гаранта</b>\n"
-                                         "Отправьте @username.", reply_markup=cancel_markup())
-    if action[1] == "newrecord" and len(action) == 3 and action[2] in KIND:
+        return await call.message.answer(
+            "➕ <b>Добавление гаранта</b>\nВведите @username:", reply_markup=cancel_markup())
+    if task == "newrecord":
+        kind = a[2] if len(a) > 2 else ""
+        if kind not in KIND:
+            return await call.message.answer("Неизвестный тип записи.")
         await state.clear()
-        await state.update_data(kind=action[2])
+        await state.update_data(kind=kind)
         await state.set_state(AddRecord.target)
-        return await call.message.answer(f"➕ <b>{safe(KIND[action[2]])}</b>\n"
-                                         "Введите @username. Запись появится в базе после "
-                                         "добавления причины и доказательств.", reply_markup=cancel_markup())
-    if action[1] in ("garants", "records"):
-        page = int(action[2]) if len(action)>2 and action[2].isdigit() else 0
-        return await admin_catalog(call.message, action[1], page)
-    if action[1] == "reports":
-        page = int(action[2]) if len(action)>2 and action[2].isdigit() else 0
-        return await admin_report_index(call.message, page)
-    if action[1] in ("garant", "record") and len(action) == 3:
-        try:
-            ident = int(action[2])
-        except ValueError:
-            return await call.message.answer("Неверный ID.")
-        model = Garant if action[1] == "garant" else Record
-        async with Sessions() as s:
-            obj = await s.get(model, ident)
-            if not obj:
-                return await call.message.answer("Запись не найдена.")
-            handle, active = obj.username or str(getattr(obj,"telegram_id","")), obj.active
-            details = (f"Страна: {safe(obj.country)}\n"
-                       f"Комиссия: {safe(obj.fee)}\n"
-                       f"Канал: {safe(obj.channel_url or 'не указан')}\n"
-                       f"Описание: {safe(obj.description)}" if model is Garant else
-                       f"Категория: {safe(KIND.get(obj.kind, obj.kind))}\n"
-                       f"Причина: {safe(obj.reason)}\n"
-                       f"Доказательства: {safe(obj.evidence_url)}")
         return await call.message.answer(
-             f"<b>#{ident} @{safe(handle)}</b>\n"
-             f"Статус: {'✅ Активна' if active else '🚫 Скрыта'}\n\n{details}",
-             reply_markup=ik([("🙈 Скрыть" if active else "♻️ Восстановить",
-                               f"admin:confirm:{action[1]}:{ident}:{int(not active)}")],
-                              [("⬅️ К списку", f"admin:{'garants' if model is Garant else 'records'}:0")]),
-             disable_web_page_preview=True)
-    if action[1] == "confirm" and len(action) == 5:
-        kind, idstr, value = action[2], action[3], action[4]
-        if kind not in ("garant", "record") or not idstr.isdigit() or value not in ("0", "1"):
-            return await call.message.answer("Неверная команда.")
+            f"➕ <b>{safe(KIND[kind])}</b>\nВведите @username:",
+            reply_markup=cancel_markup())
+
+    if task == "editgarant" and len(a) == 5:
+        gid, field, page_str = a[2], a[3], a[4]
+        if not gid.isdecimal() or not page_str.isdecimal() or field not in ("country", "fee", "channel"):
+            return await call.message.answer("Неверные параметры редактирования.")
+        await state.clear()
+        await state.update_data(garant_id=int(gid), edit_field=field, admin_page=int(page_str))
+        await state.set_state(EditGarant.value)
+        labels = {"country": "страну", "fee": "комиссию", "channel": "ссылку на канал"}
         return await call.message.answer(
-            f"Подтвердить {'восстановление' if value == '1' else 'скрытие'} "
-            f"{'гаранта' if kind == 'garant' else 'записи'} #{idstr}?",
-            reply_markup=ik([("✅ Да, применить", f"admin:toggle:{kind}:{idstr}:{value}")],
-                            [("↩️ Нет", f"admin:{kind}:{idstr}")]))
-    if action[1] == "toggle" and len(action) == 5:
-        kind, idstr, value = action[2], action[3], action[4]
-        if kind not in ("garant", "record") or not idstr.isdigit() or value not in ("0", "1"):
-            return await call.message.answer("Неверная команда.")
-        model = Garant if kind == "garant" else Record
-        async with Sessions() as s:
-            row = await s.get(model, int(idstr), with_for_update=True)
-            if not row:
-                return await call.message.answer("Запись не найдена.")
-            row.active = value == "1"
-            s.add(Audit(actor_id=call.from_user.id, action="admin_toggle",
-                        detail=f"{kind} #{row.id} active={row.active}"))
-            await s.commit()
-        try:
-            await call.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-        return await call.message.answer(
-            f"✅ {'Восстановлено' if value == '1' else 'Скрыто'}: "
-            f"{'гарант' if kind == 'garant' else 'запись'} #{idstr}.",
-            reply_markup=ik([("🔎 Открыть", f"admin:{kind}:{idstr}")],
-                            [("⬅️ К списку", f"admin:{'garants' if kind == 'garant' else 'records'}:0")]))
+            f"✏️ Изменение гаранта #{gid}\nВведите {labels[field]} "
+            "(для ссылки можно ввести - чтобы убрать):",
+            reply_markup=cancel_markup())
+
     async with Sessions() as s:
-        if action[1] == "stats":
-            return await call.message.answer("📊 <b>Статистика</b>\n"
-                    f"Пользователей: {await count(s,User)}\n"
-                    f"Проверок: {await count(s,CheckEvent)}\n"
-                    f"Гарантов: {await count(s,Garant,Garant.active.is_(True))}\n"
-                    f"Записей: {await count(s,Record,Record.active.is_(True))}\n"
-                    f"Новых жалоб: {await count(s,Report,Report.status=='pending')}\n"
-                    f"Сделок: {await count(s,Deal)}")
-        if action[1] == "reports":
-            rows = list((await s.scalars(select(Report).order_by(Report.id.desc()).limit(20))).all())
-            if not rows:
-                return await call.message.answer("Жалоб пока нет.")
-            titles = {"pending": "⏳", "approved": "✅", "rejected": "❌", "withdrawn": "↪"}
-            markup = ik(*[[(f"{titles.get(r.status, '📋')} Жалоба #{r.id}: @{r.target_username}", f"admin:report:{r.id}")] for r in rows])
-            return await call.message.answer("📥 <b>Жалобы и решения</b>\n"
-                                             "⏳ на рассмотрении · ✅ подтверждена · ❌ отклонена",
-                                             reply_markup=markup)
-        if action[1] == "report" and len(action) == 3:
-            r = await s.get(Report, int(action[2]))
-            if not r:
-                return await call.message.answer("Жалоба не найдена.")
-            k = report_actions(r.id, r.status)
-            return await call.message.answer(f"<b>Жалоба #{r.id}</b> ({safe(r.status)})\nНа: {mention(r.target_username)}\n"
-                  f"От: <code>{r.author_id}</code>\nПричина: {safe(r.reason)}\nДоказательства: {safe(r.evidence_url)}", reply_markup=k)
-        if action[1] in ("approve", "reject", "reopen") and len(action) == 3:
+        if task == "stats":
+            content = ("📊 <b>Статистика FA база</b>\n"
+                f"👤 Пользователей: {await count(s, User)}\n"
+                f"🔎 Проверок: {await count(s, CheckEvent)}\n"
+                f"💎 Активных гарантов: {await count(s, Garant, Garant.active.is_(True))}\n"
+                f"🗂 Публичных записей: {await count(s, Record, Record.active.is_(True))}\n"
+                f"📨 Ожидающих жалоб: {await count(s, Report, Report.status == 'pending')}\n"
+                f"🤝 Всего сделок: {await count(s, Deal)}")
+            return await admin_render(call, content, ik(back_admin()))
+
+        if task in ("reports", "garants", "records", "deals"):
+            page = min(max(0, int(a[2])) if len(a)>2 and a[2].isdecimal() else 0, 10000)
+            models = {"reports": Report, "garants": Garant, "records": Record, "deals": Deal}
+            titles = {"reports": "📨 Жалобы", "garants": "💎 Гаранты",
+                      "records": "🗂 Записи базы", "deals": "🤝 Сделки"}
+            model = models[task]
+            total = await count(s, model)
+            pages = max(1, (total + 5 - 1)//5)
+            page = min(page, pages-1)
+            rows = list((await s.scalars(select(model).order_by(model.id.desc())
+                                        .offset(page*5).limit(5))).all())
+            buttons = []
+            for r in rows:
+                if task == "reports":
+                    icon = {"pending": "⏳", "approved": "✅",
+                            "rejected": "❌", "withdrawn": "↪️"}.get(r.status, "📋")
+                    label = f"{icon} #{r.id} @{r.target_username}"
+                    callback = f"admin:report:{r.id}:{page}"
+                elif task == "garants":
+                    label = f"{'💎' if r.active else '🚫'} #{r.id} @{r.username}"
+                    callback = f"admin:garant:{r.id}:{page}"
+                elif task == "records":
+                    label = f"{'🔴' if r.active else '⚪'} #{r.id} @{r.username or r.telegram_id or 'ID'}"
+                    callback = f"admin:record:{r.id}:{page}"
+                else:
+                    label = f"🤝 #{r.id} @{r.target_username} · {deal_status_text(r.status)}"
+                    callback = f"admin:deal:{r.id}:{page}"
+                buttons.append([(label[:58], callback)])
+            if page > 0 or page < pages-1:
+                nav = []
+                if page > 0: nav.append(("◀", f"admin:{task}:{page-1}"))
+                nav.append((f"{page+1}/{pages}", "noop"))
+                if page < pages-1: nav.append(("▶", f"admin:{task}:{page+1}"))
+                buttons.append(nav)
+            if task == "garants":
+                buttons.append([("➕ Добавить гаранта", "admin:newgarant")])
+            if task == "records":
+                buttons.append([("➕ Скамер", "admin:newrecord:scam"),
+                                ("➕ Сомнительная", "admin:newrecord:suspicious")])
+            buttons.append(back_admin())
+            return await admin_render(
+                call, f"<b>{titles[task]}</b>\nВсего: {total}. Нажмите на запись для действий.",
+                ik(*buttons))
+
+        if task == "report" and len(a) >= 3 and a[2].isdecimal():
+            r = await s.get(Report, int(a[2]))
+            if not r: return await call.message.answer("Жалоба не найдена.")
+            page = int(a[3]) if len(a)>3 and a[3].isdecimal() else 0
+            buttons = list(report_actions(r.id, r.status).inline_keyboard)
+            buttons.append([InlineKeyboardButton(text="⬅️ К списку жалоб",
+                                                  callback_data=f"admin:reports:{page}")])
+            content = (f"📨 <b>Жалоба #{r.id}</b> · {safe(r.status)}\n"
+                      f"👤 На: {mention(r.target_username)}\n"
+                      f"От: <code>{r.author_id}</code>\n"
+                      f"Причина: {safe(r.reason)}\n"
+                      f"Материалы: {safe(r.evidence_url)}\n\n"
+                      "Подтверждение публикует запись в базе; отмена решения её скрывает.")
+            return await admin_render(call, content, InlineKeyboardMarkup(inline_keyboard=buttons))
+
+        if task in ("approve", "reject", "reopen") and len(a) >= 3 and a[2].isdecimal():
             try:
-                ident = int(action[2])
-                r = await review_report(s, ident, action[1], call.from_user.id)
+                r = await review_report(s, int(a[2]), task, call.from_user.id)
                 await s.commit()
-                report_id, status, author_id = r.id, r.status, r.author_id
-            except (ModerationError, ValueError) as exc:
+                rid, status, author = r.id, r.status, r.author_id
+            except ModerationError as exc:
                 await s.rollback()
                 return await call.message.answer("⚠️ " + safe(str(exc)))
+            labels = {"approved": "✅ Подтверждена и опубликована",
+                      "rejected": "❌ Отклонена",
+                      "pending": "↩️ Решение отменено; запись снята с публикации"}
+            await admin_render(call, f"📨 Жалоба #{rid}: {labels[status]}",
+                ik(*[[(b.text, b.callback_data) for b in row]
+                     for row in report_actions(rid,status).inline_keyboard],
+                   back_admin("reports")))
             try:
-                await call.message.edit_reply_markup(reply_markup=report_actions(report_id, status))
-            except Exception:
-                pass
-            status_labels = {"approved": "✅ Подтверждена и опубликована",
-                             "rejected": "❌ Отклонена", "pending": "↩️ Решение отменено; запись снята с публикации"}
-            await call.message.answer(f"Жалоба #{report_id}: {status_labels[status]}.",
-                                      reply_markup=report_actions(report_id, status))
-            try:
-                note = ("Решение модератора отменено. Жалоба снова рассматривается."
-                        if status == "pending" else
-                        ("Подтверждена модератором." if status == "approved" else "Отклонена после проверки."))
-                await bot.send_message(author_id, f"Жалоба #{report_id}: {note}")
+                await bot.send_message(author,
+                     f"FA база: по жалобе #{rid} новый статус — {safe(status)}.")
             except Exception:
                 pass
             return
-        if action[1] == "garants":
-            gs = list((await s.scalars(select(Garant).order_by(Garant.id.desc()).limit(15))).all())
-            text = "💎 Гаранты: \n" + "\n".join(f"#{g.id} @{safe(g.username)} ({'активен' if g.active else 'скрыт'})" for g in gs)
-            return await call.message.answer(text + "\n\n/add_garant — добавить\n/delete_garant ID — скрыть")
-        if action[1] == "records":
-            rec = list((await s.scalars(select(Record).order_by(Record.id.desc()).limit(15))).all())
-            return await call.message.answer("🗂 Записи:\n" + "\n".join(f"#{r.id} @{safe(r.username or 'ID')} {safe(r.kind)} ({'активна' if r.active else 'скрыта'})" for r in rec) + "\n\n/delete_record ID — скрыть")
-        if action[1] == "deals":
-            ds = list((await s.scalars(select(Deal).order_by(Deal.id.desc()).limit(15))).all())
-            return await call.message.answer("🤝 Сделки:\n" + "\n".join(f"#{d.id} @{safe(d.target_username)} {safe(d.status)}" for d in ds) + "\n\nЧтобы привязать группу, добавьте в неё бота с правами администратора и выполните /binddeal ID")
+
+        if task in ("garant", "record", "deal") and len(a) >= 3 and a[2].isdecimal():
+            item_id = int(a[2])
+            page = int(a[3]) if len(a)>3 and a[3].isdecimal() else 0
+            model = {"garant": Garant, "record": Record, "deal": Deal}[task]
+            row = await s.get(model,item_id)
+            if not row:
+                return await call.message.answer("Запись не найдена.")
+            section = {"garant": "garants", "record": "records", "deal": "deals"}[task]
+            buttons = []
+            if task == "garant":
+                text = (f"💎 <b>Гарант #{row.id}</b>\n"
+                        f"{mention(row.username)}\nСтрана: {safe(row.country)}\n"
+                        f"Комиссия: {safe(row.fee)}\n"
+                        f"Канал: {safe(row.channel_url or 'не указан')}\n"
+                        f"Статус: {'активен' if row.active else 'скрыт'}")
+                buttons.extend([
+                    [("✏️ Страна",f"admin:editgarant:{row.id}:country:{page}"),
+                     ("✏️ Комиссия",f"admin:editgarant:{row.id}:fee:{page}")],
+                    [("✏️ Канал",f"admin:editgarant:{row.id}:channel:{page}")],
+                    [("🚫 Скрыть" if row.active else "✅ Восстановить",
+                       f"admin:confirm:g:{row.id}:{page}")],
+                ])
+            elif task == "record":
+                text = (f"🗂 <b>Запись #{row.id}</b>\n"
+                        f"Аккаунт: {mention(row.username) if row.username else safe(row.telegram_id)}\n"
+                        f"Тип: {safe(KIND.get(row.kind,row.kind))}\n"
+                        f"Основание: {safe(row.reason)}\n"
+                        f"Материалы: {safe(row.evidence_url)}\n"
+                        f"Статус: {'активна' if row.active else 'скрыта'}")
+                buttons.append([("🚫 Скрыть" if row.active else "✅ Восстановить",
+                                f"admin:confirm:r:{row.id}:{page}")])
+            else:
+                text = (f"🤝 <b>Сделка #{row.id}</b>\n"
+                        f"Участник: {mention(row.target_username)}\n"
+                        f"Обмен: {safe(row.offered)} → {safe(row.requested)}\n"
+                        f"Сумма: {row.amount} ₽\nСтатус: {safe(deal_status_text(row.status))}")
+                if can_finish_deal(row.status):
+                    buttons.append([("✅ Завершить",f"admin:confirm:d{row.id}:done:{page}"),
+                                    ("⚠️ Спор",f"admin:confirm:d{row.id}:dispute:{page}")])
+            buttons.append(back_admin(section,page))
+            return await admin_render(call,text,ik(*buttons))
+
+        if task == "confirm" and len(a) == 5 and a[3].isdecimal():
+            typ, ident, page = a[2],int(a[3]),int(a[4]) if a[4].isdecimal() else 0
+            if typ not in ("g", "r") and not (typ.startswith("d") and typ[1:].isdecimal()):
+                return await call.message.answer("Неверное действие.")
+            if typ in ("g","r"):
+                model = Garant if typ == "g" else Record
+                r = await s.get(model,ident)
+                if not r: return await call.message.answer("Запись не найдена.")
+                section = "garant" if typ == "g" else "record"
+                message_text = f"Подтвердить изменение видимости #{ident}?"
+                actual = f"admin:toggle:{typ}:{ident}:{page}"
+                back = f"admin:{section}:{ident}:{page}"
+            else:
+                return await call.message.answer("Неверное действие.")
+            return await admin_render(call, "⚠️ <b>"+message_text+"</b>",
+                                      ik([("✅ Да, выполнить",actual)],
+                                         [("⬅️ Отмена",back)]))
+
+        if task == "toggle" and len(a) == 5 and a[3].isdecimal():
+            typ,ident,page = a[2],int(a[3]),int(a[4]) if a[4].isdecimal() else 0
+            if typ not in ("g","r"):
+                return await call.message.answer("Неверный тип.")
+            model = Garant if typ=="g" else Record
+            row = await s.get(model,ident)
+            if not row: return await call.message.answer("Запись не найдена.")
+            row.active = not row.active
+            s.add(Audit(actor_id=call.from_user.id,action="admin_toggle",
+                        detail=f"{model.__name__} #{ident}: {row.active}"))
+            await s.commit()
+            return await admin_render(call,
+                f"✅ {model.__name__} #{ident}: {'активно' if row.active else 'скрыто'}.",
+                ik([("↩️ К записи",f"admin:{'garant' if typ=='g' else 'record'}:{ident}:{page}")],
+                   back_admin()))
+
+    return await call.message.answer("Неизвестное действие. Вернитесь в /admin.")
+
+
+@router.message(EditGarant.value)
+async def admin_edit_garant_value(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return await message.answer("Нет доступа.")
+    d = await state.get_data()
+    field = d.get("edit_field")
+    val = (message.text or "").strip()
+    if field == "country" and not 1 <= len(val) <= 80:
+        return await message.answer("Страна: 1–80 символов.")
+    if field == "fee" and not 1 <= len(val) <= 80:
+        return await message.answer("Комиссия: 1–80 символов.")
+    if field == "channel" and val != "-":
+        try:
+            val = evidence_url(val)
+        except ValueError as exc:
+            return await message.answer(safe(exc))
+    async with Sessions() as s:
+        row = await s.get(Garant,int(d["garant_id"]))
+        if not row:
+            await state.clear()
+            return await message.answer("Гарант не найден.")
+        setattr(row, "channel_url" if field == "channel" else field,
+                None if field == "channel" and val=="-" else val)
+        s.add(Audit(actor_id=message.from_user.id,action="edit_garant",
+                    detail=f"#{row.id} {field}"))
+        await s.commit()
+    await state.clear()
+    await message.answer("✅ Данные гаранта обновлены.",
+        reply_markup=ik([("💎 Открыть гаранта",
+                          f"admin:garant:{d['garant_id']}:{d.get('admin_page',0)}")],
+                        [("🛠 Админ-панель", "admin:home")]))
 
 
 @router.message(Command("reports"))
