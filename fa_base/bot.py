@@ -14,7 +14,7 @@ from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (BotCommand, CallbackQuery, InlineKeyboardButton,
-                           InlineKeyboardMarkup, Message)
+                           InlineKeyboardMarkup, Message, FSInputFile)
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,6 +25,7 @@ from .keyboards import home_links, main_menu, admin_menu
 from .policies import (MAX_DEALS_PER_DAY, MAX_REPORTS_PER_DAY, identity_matches,
                        deal_status_text, can_cancel_deal, can_finish_deal)
 from .utils import evidence_url, mention, parse_amount, safe, username
+from .branding import banner_path
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -87,6 +88,15 @@ async def notify_admins(bot: Bot, text: str, markup=None):
             log.warning("Admin notification %s: %s", admin_id, ex)
 
 
+async def send_cover(message: Message, kind: str, caption: str, reply_markup=None):
+    """Original artwork with graceful fallback to plain text."""
+    try:
+        await message.answer_photo(FSInputFile(banner_path(kind)), caption=caption[:1024], reply_markup=reply_markup)
+    except Exception as exc:
+        log.warning("Cover image failed: %s", type(exc).__name__)
+        await message.answer(caption, reply_markup=reply_markup, disable_web_page_preview=True)
+
+
 async def menu(message: Message):
     text = ("<b>FA база — проверка и безопасность сделок</b>\n\n"
             "Привет! Здесь можно проверить записи о пользователе, найти гаранта "
@@ -95,7 +105,7 @@ async def menu(message: Message):
             "Жалобы проверяет модератор.\n\n"
             f"👑 Владелец проекта: {mention(OWNER)}\n"
             "🔎 /check @username — поиск по базе\n👤 /me — мой профиль\n💎 /garants — гаранты\n🤝 /deal — предложить сделку")
-    await message.answer(text, reply_markup=home_links(cfg))
+    await send_cover(message, "welcome", text, reply_markup=home_links(cfg))
     await message.answer("Выберите раздел в меню 👇", reply_markup=main_menu())
 
 
@@ -259,7 +269,7 @@ async def info_cmd(message: Message):
         suspicious = await count(s, Record, Record.kind == "suspicious", Record.active.is_(True))
         garants = await count(s, Garant, Garant.active.is_(True))
         reports = await count(s, Report, Report.status == "pending")
-    await message.answer("ℹ️ <b>FA база</b>\n\n"
+    await send_cover(message, "info", "ℹ️ <b>FA база</b>\n\n"
                          "Реестр модерируемых сообщений о рисках при обменах игровыми ценностями.\n\n"
                          f"📌 Подтверждённых записей: {scammers}\n"
                          f"🔸 Сомнительных услуг: {suspicious}\n"
@@ -291,6 +301,8 @@ async def send_garants(message: Message, page: int = 0, edit: bool = False):
              ("▶️", f"garants:{min(pages-1,page+1)}")],
             [("❔ Зачем нужен гарант", "garants:what")],
             [("🔎 Поиск гарантов", "url:"+cfg.garant_chat_url)])
+    if not edit and page == 0:
+        await send_cover(message, "garants", "💎 FA база — реестр гарантов. Профили добавляются администрацией.")
     if edit:
         try:
             return await message.edit_text(text[:3900], reply_markup=kb, disable_web_page_preview=True)
