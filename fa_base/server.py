@@ -16,6 +16,7 @@ from sqlalchemy import select, func
 
 from .db import Audit, Deal, Garant, Record, Report, User, CheckEvent, build_db, initialize, count
 from .utils import username, evidence_url
+from .moderation import ModerationError, review_report as apply_report_review
 
 
 engine = None
@@ -256,27 +257,30 @@ async def reports(request:Request):
         items=(await s.scalars(select(Report).order_by(Report.id.desc()).limit(200))).all()
     trs=''
     for r in items:
-        actions=(f'<form class="inline" method="post" action="/admin/reports/{r.id}/approve">{csrf_input()}<button>Подтвердить</button></form>'
-                 f'<form class="inline" method="post" action="/admin/reports/{r.id}/reject">{csrf_input()}<button class="danger">Отклонить</button></form>') if r.status=='pending' else ''
+        if r.status == "pending":
+            actions=(f'<form class="inline" method="post" action="/admin/reports/{r.id}/approve">{csrf_input()}<button>✅ Подтвердить</button></form>'
+                     f'<form class="inline" method="post" action="/admin/reports/{r.id}/reject">{csrf_input()}<button class="danger">❌ Отклонить</button></form>')
+        elif r.status in ("approved", "rejected"):
+            actions=(f'<form class="inline" method="post" action="/admin/reports/{r.id}/reopen">{csrf_input()}'
+                     '<button class="danger">↩ Отменить решение</button></form>')
+        else:
+            actions = '<span class="muted">Автор отозвал жалобу</span>'
         trs+=f'<tr><td>#{r.id}</td><td>@{esc(r.target_username)}</td><td>{esc(r.reason)}</td><td>{esc(r.evidence_url)}</td><td><span class="badge">{esc(r.status)}</span></td><td>{actions}</td></tr>'
     return page('Жалобы',f'<div class="card"><h2>Модерация жалоб</h2><p class="muted">Одобряйте запись только после проверки доказательств. В публичной базе не должно быть необоснованных обвинений.</p><table><tr><th>ID</th><th>Пользователь</th><th>Описание</th><th>Доказательства</th><th>Статус</th><th>Модерация</th></tr>{trs}</table></div>')
 
 
 @app.post('/admin/reports/{rid}/{action}')
-async def review_report(rid:int,action:str,request:Request,csrf:str=Form()):
-    check_csrf(request,csrf)
-    if action not in ('approve','reject'):raise HTTPException(404)
+async def report_moderation(rid: int, action: str, request: Request, csrf: str = Form()):
+    check_csrf(request, csrf)
+    if action not in ('approve', 'reject', 'reopen'):
+        raise HTTPException(404)
     async with Sessions() as s:
-        r=await s.get(Report,rid)
-        if not r or r.status!='pending':raise HTTPException(409,'Жалоба уже рассмотрена')
-        if action=='approve':
-            u=await s.scalar(select(User).where(User.username==r.target_username))
-            s.add(Record(username=r.target_username,telegram_id=u.id if u else None,kind='scam',reason=r.reason,evidence_url=r.evidence_url,created_by=0))
-            r.status='approved'
-        else:r.status='rejected'
-        r.reviewed_by=0
-        s.add(Audit(actor_id=0,action='web_review_report',detail=f'{rid}:{r.status}'))
-        await s.commit()
+        try:
+            await apply_report_review(s, rid, action, actor_id=0)
+            await s.commit()
+        except ModerationError as exc:
+            await s.rollback()
+            raise HTTPException(409, str(exc)) from exc
     return redirect('/admin/reports')
 
 
