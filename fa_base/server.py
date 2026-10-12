@@ -14,8 +14,9 @@ from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from sqlalchemy import select, func
 
-from .db import Audit, Deal, Garant, Record, Report, User, CheckEvent, build_db, initialize, count
+from .db import Audit, Deal, Garant, Record, Report, Appeal, User, CheckEvent, build_db, initialize, count
 from .utils import username, evidence_url
+from .appeals import review_appeal, AppealError
 from .moderation import ModerationError, review_report as apply_report_review
 
 
@@ -52,14 +53,14 @@ app = FastAPI(title="FA база — админ-панель", lifespan=lifespan
 STYLE = """<style>
 :root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#0b111e;color:#e7eaf2;font:15px system-ui,Arial,sans-serif}
 a{color:#f28c9d}.wrap{max-width:1180px;margin:auto;padding:30px 18px}h1{font-size:30px}h2{font-size:19px}
-nav{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:24px}nav a,.button{color:#fff;background:#293445;text-decoration:none;border-radius:10px;padding:9px 15px}
+nav{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:24px}nav a,.button{color:#fff;background:#293445;text-decoration:none;border-radius:10px;padding:9px 15px;white-space:nowrap}nav{overflow-x:auto}
 .card{background:#172335;border:1px solid #2d384a;border-radius:16px;padding:20px;margin:18px 0;box-shadow:0 10px 30px #0002}
 .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:12px}.kpi{background:#19293a;border-radius:12px;padding:16px}.kpi b{font-size:25px;display:block;color:#fa8ca1}
 input,textarea,select{width:100%;border:1px solid #405064;background:#0e1727;color:#fff;padding:11px;border-radius:9px;margin:6px 0 14px}
 button{background:#ce506f;color:white;border:0;padding:10px 16px;border-radius:9px;cursor:pointer;font-weight:600}
 button.danger{background:#7f3844}.formgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
 table{border-collapse:collapse;width:100%;display:block;overflow:auto}th,td{border-bottom:1px solid #324053;padding:12px 10px;text-align:left;vertical-align:top;max-width:360px;overflow-wrap:anywhere}th{color:#a9b9cf}
-.badge{padding:4px 8px;border-radius:8px;background:#34445b;font-size:12px}.error{color:#ff9aac}.muted{color:#9baabe}.inline{display:inline}details{margin:8px 0}summary{cursor:pointer}form.inline button{padding:7px 12px;margin:2px}
+.badge{padding:4px 8px;border-radius:8px;background:#34445b;font-size:12px}.error{color:#ff9aac}.muted{color:#9baabe}.inline{display:inline}details{margin:8px 0}summary{cursor:pointer}form.inline button{padding:7px 12px;margin:2px}html{scroll-behavior:smooth}button:hover,.button:hover{filter:brightness(1.14)}button:focus-visible,a:focus-visible{outline:3px solid #f5b0be;outline-offset:2px}@media(max-width:650px){.wrap{padding:16px 10px}h1{font-size:23px}nav{flex-wrap:nowrap;overflow-x:auto;padding-bottom:6px}.card{padding:13px;border-radius:12px}td,th{padding:9px 7px}button{min-height:42px}table{width:100%;max-width:100%;}input,textarea,select{font-size:16px}}
 </style>"""
 
 
@@ -68,7 +69,7 @@ def esc(v):
 
 
 def page(title: str, body: str, nav=True):
-    top = '<nav><a href="/admin">Обзор</a><a href="/admin/garants">Гаранты</a><a href="/admin/records">Записи базы</a><a href="/admin/reports">Жалобы</a><a href="/admin/deals">Сделки</a><a href="/admin/logout">Выход</a></nav>' if nav else ''
+    top = '<nav><a href="/admin">Обзор</a><a href="/admin/garants">Гаранты</a><a href="/admin/records">Записи базы</a><a href="/admin/reports">Жалобы</a><a href="/admin/appeals">Апелляции</a><a href="/admin/deals">Сделки</a><a href="/admin/logout">Выход</a></nav>' if nav else ''
     return HTMLResponse(f'<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} • FA база</title>{STYLE}<div class="wrap"><h1>◆ FA база</h1>{top}<main>{body}</main></div></html>')
 
 
@@ -164,6 +165,7 @@ async def dashboard(request: Request):
                    ("Гаранты", await count(s, Garant, Garant.active.is_(True))),
                    ("Записи", await count(s, Record, Record.active.is_(True))),
                    ("Ожидают проверки", await count(s, Report, Report.status == 'pending')),
+                   ("Апелляции", await count(s, Appeal, Appeal.status == 'pending')),
                    ("Сделки", await count(s, Deal))]
     tiles = ''.join(f'<div class="kpi"><b>{v}</b>{esc(k)}</div>' for k,v in numbers)
     return page("Обзор", f'<h2>Панель управления</h2><div class="kpis">{tiles}</div><div class="card"><p>Владелец проекта: <b>@mops_garant</b></p><p>Редактируйте список гарантов и записи, проверяйте жалобы и отслеживайте сделки.</p><p class="muted">Все жалобы поступают в закрытую модерацию и появляются в базе только после ручного одобрения.</p></div>')
@@ -282,6 +284,60 @@ async def report_moderation(rid: int, action: str, request: Request, csrf: str =
             await s.rollback()
             raise HTTPException(409, str(exc)) from exc
     return redirect('/admin/reports')
+
+
+@app.get('/admin/appeals')
+async def appeals(request:Request):
+    if not get_admin(request):
+        return redirect('/admin/login')
+    status = request.query_params.get('status', 'pending')
+    if status not in ('pending','approved','rejected','all'):
+        status = 'pending'
+    async with Sessions() as s:
+        q = select(Appeal).order_by(Appeal.id.desc()).limit(200)
+        if status != 'all':
+            q = q.where(Appeal.status == status)
+        items = list((await s.scalars(q)).all())
+    tabs = '<div class="row">' + ' · '.join(
+        f'<a href="/admin/appeals?status={opt}">{esc(label)}</a>'
+        for opt,label in [('pending','На рассмотрении'),('approved','Удовлетворены'),
+                          ('rejected','Отклонены'),('all','Все')]) + '</div>'
+    trs = ''
+    for ap in items:
+        actions = ''
+        if ap.status == 'pending':
+            actions = (f'<form class="inline" method="post" action="/admin/appeals/{ap.id}/approve">'
+                       f'{csrf_input()}<button>✅ Удовлетворить</button></form>'
+                       f'<form class="inline" method="post" action="/admin/appeals/{ap.id}/reject">'
+                       f'{csrf_input()}<button class="danger">❌ Отклонить</button></form>')
+        trs += (f'<tr><td>#{ap.id}</td><td>Запись #{ap.record_id}</td>'
+                f'<td>{esc(ap.author_id)}</td><td>{esc(ap.reason)}</td>'
+                f'<td><a target="_blank" rel="noopener noreferrer" '
+                f'href="{esc(ap.evidence_url)}">Доказательства ↗</a></td>'
+                f'<td>{esc(ap.status)}</td><td>{actions}</td></tr>')
+    return page('Апелляции',
+        '<div class="card"><h2>📝 Апелляции</h2>'
+        '<p>Удовлетворённая апелляция скрывает только связанную запись. '
+        'Проверьте доказательства до принятия решения.</p>'
+        + tabs
+        + '<table><tr><th>ID</th><th>Запись</th><th>Автор</th><th>Причина</th>'
+          '<th>Материалы</th><th>Статус</th><th>Решение</th></tr>'
+        + trs + '</table></div>')
+
+
+@app.post('/admin/appeals/{appeal_id}/{action}')
+async def resolve_appeal_web(appeal_id: int, action: str, request: Request, csrf: str = Form()):
+    check_csrf(request, csrf)
+    if action not in ('approve','reject'):
+        raise HTTPException(404)
+    async with Sessions() as s:
+        try:
+            await review_appeal(s, appeal_id, action == 'approve', actor_id=0)
+            await s.commit()
+        except AppealError as exc:
+            await s.rollback()
+            raise HTTPException(409, str(exc)) from exc
+    return redirect('/admin/appeals?status=pending')
 
 
 @app.get('/admin/deals')
