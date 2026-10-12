@@ -38,7 +38,8 @@ def garants_nav(page, total_pages, cfg):
 
 def admin_menu():
     return inline(
-        [("📥 Модерация жалоб", "admin:reports", False)],
+        [("📥 Модерация жалоб", "admin:reports", False),
+         ("📝 Апелляции", "admin:appeals:0", False)],
         [("💎 Управление гарантами", "admin:garants:0", False),
          ("🗂 Записи базы", "admin:records:0", False)],
         [("➕ Добавить гаранта", "admin:newgarant", False)],
