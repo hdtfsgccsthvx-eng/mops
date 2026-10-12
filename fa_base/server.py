@@ -113,7 +113,10 @@ def redirect(url):
 
 @app.get("/health")
 async def health():
-    return {"status":"ok", "bot_configured":bool(os.getenv("BOT_TOKEN") and os.getenv("ADMIN_IDS")), "bot_running":bool(running_bot and not running_bot.done())}
+    configured = bool(os.getenv("BOT_TOKEN") and os.getenv("ADMIN_IDS"))
+    running = bool(running_bot and not running_bot.done())
+    return {"status": "ok" if not configured or running else "degraded",
+            "bot_configured": configured, "bot_running": running}
 
 
 @app.get("/")
