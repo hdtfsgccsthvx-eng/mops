@@ -25,8 +25,8 @@ from .keyboards import home_links, main_menu, admin_menu
 from .policies import (MAX_DEALS_PER_DAY, MAX_REPORTS_PER_DAY, identity_matches,
                        deal_status_text, can_cancel_deal, can_finish_deal)
 from .utils import evidence_url, mention, parse_amount, safe, username
-from .branding import banner_path
-from .moderation import ModerationError, review_report, avatar_path
+from .branding import banner_path, avatar_path
+from .moderation import ModerationError, review_report
 
 log = logging.getLogger(__name__)
 router = Router()
