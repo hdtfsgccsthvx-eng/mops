@@ -85,6 +85,17 @@ class Audit(Base):
     at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class ReputationVote(Base):
+    """Community assessments, not verified facts. One vote per account per subject."""
+    __tablename__ = "reputation_votes"
+    __table_args__ = (UniqueConstraint("voter_id", "subject_key", name="uq_reputation_vote"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    voter_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    subject_key: Mapped[str] = mapped_column(String(48), index=True)
+    score: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class CheckEvent(Base):
     __tablename__ = "check_events"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
