@@ -713,7 +713,7 @@ async def admin_callback(call: CallbackQuery, bot: Bot, state: FSMContext):
                      ("✏️ Комиссия",f"admin:editgarant:{row.id}:fee:{page}")],
                     [("✏️ Канал",f"admin:editgarant:{row.id}:channel:{page}")],
                     [("🚫 Скрыть" if row.active else "✅ Восстановить",
-                       f"admin:confirm:g:{row.id}:{page}")],
+                       f"admin:confirm:g:{row.id}:{page}:{int(not row.active)}")],
                 ])
             elif task == "record":
                 text = (f"🗂 <b>Запись #{row.id}</b>\n"
@@ -723,7 +723,7 @@ async def admin_callback(call: CallbackQuery, bot: Bot, state: FSMContext):
                         f"Материалы: {safe(row.evidence_url)}\n"
                         f"Статус: {'активна' if row.active else 'скрыта'}")
                 buttons.append([("🚫 Скрыть" if row.active else "✅ Восстановить",
-                                f"admin:confirm:r:{row.id}:{page}")])
+                                f"admin:confirm:r:{row.id}:{page}:{int(not row.active)}")])
             else:
                 text = (f"🤝 <b>Сделка #{row.id}</b>\n"
                         f"Участник: {mention(row.target_username)}\n"
@@ -735,7 +735,7 @@ async def admin_callback(call: CallbackQuery, bot: Bot, state: FSMContext):
             buttons.append(back_admin(section,page))
             return await admin_render(call,text,ik(*buttons))
 
-        if task == "confirm" and len(a) == 5:
+        if task == "confirm" and len(a) in (5, 6):
             if a[2] in ("g", "r") and a[3].isdecimal():
                 typ, ident, page = a[2], int(a[3]), int(a[4]) if a[4].isdecimal() else 0
                 model = Garant if typ == "g" else Record
@@ -743,8 +743,12 @@ async def admin_callback(call: CallbackQuery, bot: Bot, state: FSMContext):
                 if not r:
                     return await call.message.answer("Запись не найдена.")
                 section = "garant" if typ == "g" else "record"
-                message_text = f"Подтвердить изменение видимости #{ident}?"
-                actual = f"admin:toggle:{typ}:{ident}:{page}"
+                desired = a[5] if len(a) == 6 else str(int(not r.active))
+                if desired not in ("0", "1"):
+                    return await call.message.answer("Неверный статус.")
+                message_text = (("Восстановить" if desired == "1" else "Скрыть")
+                                + f" запись #{ident}?")
+                actual = f"admin:toggle:{typ}:{ident}:{page}:{desired}"
                 back = f"admin:{section}:{ident}:{page}"
             elif a[2].startswith("d") and a[2][1:].isdecimal() and a[3] in ("done", "dispute"):
                 ident, operation = int(a[2][1:]), a[3]
@@ -783,19 +787,25 @@ async def admin_callback(call: CallbackQuery, bot: Bot, state: FSMContext):
                         pass
             return
 
-        if task == "toggle" and len(a) == 5 and a[3].isdecimal():
+        if task == "toggle" and len(a) in (5, 6) and a[3].isdecimal():
             typ,ident,page = a[2],int(a[3]),int(a[4]) if a[4].isdecimal() else 0
             if typ not in ("g","r"):
                 return await call.message.answer("Неверный тип.")
-            model = Garant if typ=="g" else Record
-            row = await s.get(model,ident)
-            if not row: return await call.message.answer("Запись не найдена.")
-            row.active = not row.active
-            s.add(Audit(actor_id=call.from_user.id,action="admin_toggle",
-                        detail=f"{model.__name__} #{ident}: {row.active}"))
-            await s.commit()
+            if len(a) != 6 or a[5] not in ("0","1"):
+                return await call.message.answer("Кнопка устарела. Откройте запись заново, "
+                                                 "чтобы безопасно изменить статус.")
+            desired = a[5] == "1"
+            model = Garant if typ == "g" else Record
+            row = await s.get(model,ident,with_for_update=True)
+            if not row:
+                return await call.message.answer("Запись не найдена.")
+            if row.active != desired:
+                row.active = desired
+                s.add(Audit(actor_id=call.from_user.id,action="admin_toggle",
+                            detail=f"{model.__name__} #{ident}: {desired}"))
+                await s.commit()
             return await admin_render(call,
-                f"✅ {model.__name__} #{ident}: {'активно' if row.active else 'скрыто'}.",
+                f"✅ {model.__name__} #{ident}: {'активно' if desired else 'скрыто'}.",
                 ik([("↩️ К записи",f"admin:{'garant' if typ=='g' else 'record'}:{ident}:{page}")],
                    back_admin()))
 
