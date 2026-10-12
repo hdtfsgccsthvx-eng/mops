@@ -4,6 +4,7 @@ import asyncio
 import os
 import secrets
 from contextlib import asynccontextmanager
+import sys
 from datetime import datetime
 from html import escape
 from urllib.parse import quote
@@ -113,15 +114,15 @@ def redirect(url):
 
 @app.get("/health")
 async def health():
-    from . import bot as bot_module
+    bot_module = sys.modules.get("fa_base.bot")
     configured = bool(os.getenv("BOT_TOKEN") and os.getenv("ADMIN_IDS"))
     running = bool(running_bot and not running_bot.done())
-    ready = bool(running and bot_module.BOT_READY)
+    ready = bool(running and bot_module and getattr(bot_module, "BOT_READY", False))
     return {"status": "ok" if ready else "degraded",
             "bot_configured": configured, "bot_running": running,
             "bot_ready": ready,
-            "bot_username": bot_module.BOT_NAME if ready else None,
-            "bot_error": bot_module.BOT_ERROR or None}
+            "bot_username": getattr(bot_module, "BOT_NAME", None) if ready else None,
+            "bot_error": getattr(bot_module, "BOT_ERROR", "") or None}
 
 
 @app.get("/")
