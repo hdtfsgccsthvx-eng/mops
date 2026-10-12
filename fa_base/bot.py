@@ -932,6 +932,15 @@ async def run():
     try:
         me = await bot.get_me()
         BOT_NAME = me.username
+        try:
+            await bot.set_my_name(name="FA база")
+            await bot.set_my_description(description=(
+                "FA база — проверка записей о пользователях, каталог гарантов, "
+                "жалобы на модерацию и согласование безопасных сделок. Владелец @mops_garant."))
+            await bot.set_my_short_description(short_description=(
+                "FA база: проверка аккаунтов, гаранты и сделки. Владелец @mops_garant."))
+        except Exception as exc:
+            log.warning("Bot profile metadata not updated: %s", type(exc).__name__)
         await setup_commands(bot)
         BOT_READY = True
         print(f"FA база: Telegram bot @{BOT_NAME} ready for polling", flush=True)
