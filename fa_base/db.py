@@ -69,6 +69,19 @@ class ReportRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class Appeal(Base):
+    """An appeal concerns one public record. Evidence stays with moderators."""
+    __tablename__ = "appeals"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    record_id: Mapped[int] = mapped_column(Integer, ForeignKey("records.id"), index=True)
+    author_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    reason: Mapped[str] = mapped_column(Text)
+    evidence_url: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    reviewed_by: Mapped[Optional[int]] = mapped_column(BigInteger)
+
+
 class Deal(Base):
     __tablename__ = "deals"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
