@@ -8,13 +8,16 @@ def inline(*rows):
     ])
 
 
-def main_menu():
-    return ReplyKeyboardMarkup(keyboard=[
+def main_menu(admin: bool = False):
+    buttons = [
         [KeyboardButton(text="🔎 Проверить"), KeyboardButton(text="👤 Мой профиль")],
         [KeyboardButton(text="💎 Гаранты"), KeyboardButton(text="🤝 Новая сделка")],
         [KeyboardButton(text="⚠️ Сообщить о мошенничестве")],
         [KeyboardButton(text="ℹ️ О проекте"), KeyboardButton(text="📋 Команды")]
-    ], resize_keyboard=True)
+    ]
+    if admin:
+        buttons.append([KeyboardButton(text="🛠 Админ-панель")])
+    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
 
 def home_links(cfg):
