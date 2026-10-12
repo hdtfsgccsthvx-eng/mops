@@ -85,11 +85,14 @@ def report_actions(report_id: int, status: str):
     if status == "pending":
         return ik([("✅ Подтвердить", f"admin:approve:{report_id}"),
                    ("❌ Отклонить", f"admin:reject:{report_id}")],
-                  [("📋 Подробности", f"admin:report:{report_id}")])
+                  [("📋 Подробности", f"admin:report:{report_id}"),
+                   ("📥 Список жалоб", "admin:reports:0")])
     if status in ("approved", "rejected"):
         return ik([("↩️ Отменить решение", f"admin:reopen:{report_id}")],
-                  [("📋 Подробности", f"admin:report:{report_id}")])
-    return ik([("📋 Подробности", f"admin:report:{report_id}")])
+                  [("📋 Подробности", f"admin:report:{report_id}"),
+                   ("📥 Список жалоб", "admin:reports:0")])
+    return ik([("📋 Подробности", f"admin:report:{report_id}"),
+               ("📥 Список жалоб", "admin:reports:0")])
 
 
 async def notify_admins(bot: Bot, text: str, markup=None):
@@ -504,7 +507,7 @@ async def admin(message: Message):
 
 
 @router.callback_query(F.data.startswith("admin:"))
-async def admin_callback(call: CallbackQuery, bot: Bot):
+async def admin_callback(call: CallbackQuery, bot: Bot, state: FSMContext):
     if not is_admin(call.from_user.id):
         return await call.answer("Нет доступа", show_alert=True)
     await call.answer()
