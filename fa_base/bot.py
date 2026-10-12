@@ -14,7 +14,7 @@ from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (BotCommand, CallbackQuery, InlineKeyboardButton,
-                           InlineKeyboardMarkup, Message, FSInputFile)
+                           InlineKeyboardMarkup, Message, FSInputFile, InputProfilePhotoStatic)
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,7 +25,7 @@ from .keyboards import home_links, main_menu, admin_menu
 from .policies import (MAX_DEALS_PER_DAY, MAX_REPORTS_PER_DAY, identity_matches,
                        deal_status_text, can_cancel_deal, can_finish_deal)
 from .utils import evidence_url, mention, parse_amount, safe, username
-from .branding import banner_path
+from .branding import banner_path, avatar_path
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -901,6 +901,27 @@ async def text_menu(message: Message, state: FSMContext):
         return await commands(message)
 
 
+
+async def ensure_bot_avatar(bot: Bot):
+    """Apply FA база avatar once; persist successful uploads across redeploys."""
+    version = "fa-brand-avatar-v1"
+    async with Sessions() as s:
+        existing = await s.scalar(select(Audit.id).where(
+            Audit.action == "bot_avatar_applied", Audit.detail == version).limit(1))
+    if existing:
+        return
+    try:
+        await bot.set_my_profile_photo(
+            photo=InputProfilePhotoStatic(photo=FSInputFile(avatar_path())))
+    except Exception as exc:
+        log.warning("Failed to update FA база avatar: %s", type(exc).__name__)
+        return
+    async with Sessions() as s:
+        s.add(Audit(actor_id=0, action="bot_avatar_applied", detail=version))
+        await s.commit()
+    print("FA база: custom Telegram profile avatar installed", flush=True)
+
+
 async def setup_commands(bot: Bot):
     await bot.set_my_commands([
         BotCommand(command="start", description="Главное меню"),
@@ -941,6 +962,7 @@ async def run():
                 "FA база: проверка аккаунтов, гаранты и сделки. Владелец @mops_garant."))
         except Exception as exc:
             log.warning("Bot profile metadata not updated: %s", type(exc).__name__)
+        await ensure_bot_avatar(bot)
         await setup_commands(bot)
         BOT_READY = True
         print(f"FA база: Telegram bot @{BOT_NAME} ready for polling", flush=True)
