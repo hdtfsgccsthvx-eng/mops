@@ -19,7 +19,7 @@ from sqlalchemy import func, or_, select, text as sql_text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import Config
-from .db import (Audit, CheckEvent, Deal, Garant, Record, Report, User, ReputationVote,
+from .db import (Audit, CheckEvent, Deal, Garant, Record, Report, Appeal, User, ReputationVote,
                  audit, build_db, count, initialize, resolve_user, touch_user)
 from .keyboards import home_links, main_menu, admin_menu
 from .policies import (MAX_DEALS_PER_DAY, MAX_REPORTS_PER_DAY, identity_matches,
@@ -27,6 +27,7 @@ from .policies import (MAX_DEALS_PER_DAY, MAX_REPORTS_PER_DAY, identity_matches,
 from .utils import evidence_url, mention, parse_amount, safe, username
 from .branding import banner_path, avatar_path
 from .moderation import ModerationError, review_report
+from .appeals import AppealError, review_appeal, can_create_appeal
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -38,6 +39,12 @@ BOT_ERROR = ""
 OWNER = "@mops_garant"
 KIND = {"scam": "Подтверждённая запись о мошенничестве", "suspicious": "Сомнительные услуги"}
 ASSETS = ("Деньги", "MM2", "Адопт", "Робуксы", "Blade Ball", "Grow Garden", "Другое")
+
+
+class AppealForm(StatesGroup):
+    record = State()
+    reason = State()
+    evidence = State()
 
 
 class CheckForm(StatesGroup):
@@ -137,6 +144,8 @@ async def start(message: Message, command: CommandObject, state: FSMContext, bot
     await state.clear()
     async with Sessions() as s:
         await touch_user(s, message.from_user)
+    if command.args == "appeal":
+        return await appeal(message, state)
     if command.args and command.args.startswith("check_"):
         try:
             checked_id = int(command.args[6:])
@@ -221,7 +230,12 @@ async def show_check(message: Message, requested: str | None, requested_id: int 
         rows.append([("👍 Поддержать", f"vote:plus:{target}"),
                      ("👎 Предостеречь", f"vote:minus:{target}")])
     rows.append([("🔎 Другая проверка", "check:start")])
-    rows.append([("📝 Подать апелляцию", "appeal:start")])
+    if records:
+        for record in records[:5]:
+            rows.append([(f"📝 Оспорить запись #{record.id}",
+                          f"appeal:record:{record.id}")])
+    else:
+        rows.append([("📝 Подать апелляцию", "appeal:start")])
     rows.append([("⚠️ Сообщить о мошенничестве", "report:start")])
     await send_cover(message, "check", "🔎 Результат проверки пользователя в FA база. Данные проверяйте самостоятельно.")
     await message.answer(text[:3900], reply_markup=ik(*rows), disable_web_page_preview=True)
@@ -461,14 +475,116 @@ async def report_evidence(message: Message, state: FSMContext, bot: Bot):
                         report_actions(report_id, "pending"))
 
 
-@router.callback_query(F.data == "appeal:start")
+@router.callback_query(F.data.startswith("appeal:"))
 @router.message(Command("appeal"))
-async def appeal(event: Message | CallbackQuery):
+async def appeal(event: Message | CallbackQuery, state: FSMContext):
     m = event.message if isinstance(event, CallbackQuery) else event
     if isinstance(event, CallbackQuery):
         await event.answer()
-    await m.answer("📝 <b>Апелляция</b>\n\nЕсли запись ошибочна, напишите владельцу проекта и приложите ссылку на запись, пояснения и подтверждения. Апелляции проверяются вручную.",
-                   reply_markup=ik([("Отправить апелляцию", "url:" + cfg.appeal_url)]))
+    if m.chat.type != "private":
+        return await m.answer(f"Для конфиденциальной апелляции откройте личный чат с ботом: "
+                              f"https://t.me/{BOT_NAME}?start=appeal")
+    raw = ""
+    if isinstance(event, CallbackQuery) and event.data.startswith("appeal:record:"):
+        raw = event.data.rsplit(":", 1)[-1]
+    elif isinstance(event, Message):
+        raw = (event.text or "").partition(" ")[2].strip()
+    await state.clear()
+    if raw.isdecimal():
+        async with Sessions() as s:
+            item = await s.get(Record, int(raw))
+        if item is None or not item.active:
+            return await m.answer("Эта запись отсутствует или уже скрыта.")
+        await state.update_data(record_id=item.id)
+        await state.set_state(AppealForm.reason)
+        return await m.answer(f"📝 <b>Апелляция по записи #{item.id}</b>\n"
+                              "Напишите, почему запись ошибочна (15–2000 символов).",
+                              reply_markup=cancel_markup())
+    await state.set_state(AppealForm.record)
+    await m.answer("📝 <b>Подать апелляцию</b>\n"
+                   "Введите номер публичной записи из результата /check. "
+                   "Оспаривание рассматривает модератор, запись не удаляется автоматически.",
+                   reply_markup=cancel_markup())
+
+
+@router.message(AppealForm.record)
+async def appeal_record(message: Message, state: FSMContext):
+    raw = (message.text or "").strip().lstrip("#")
+    if not raw.isdecimal():
+        return await message.answer("Нужен числовой номер записи. Например: 12")
+    async with Sessions() as s:
+        item = await s.get(Record, int(raw))
+    if item is None or not item.active:
+        return await message.answer("Запись не найдена или уже скрыта.")
+    await state.update_data(record_id=item.id)
+    await state.set_state(AppealForm.reason)
+    return await message.answer(f"Запись #{item.id} найдена. Опишите, что в ней ошибочно "
+                                "(15–2000 символов).", reply_markup=cancel_markup())
+
+
+@router.message(AppealForm.reason)
+async def appeal_reason(message: Message, state: FSMContext):
+    reason = (message.text or "").strip()
+    if not 15 <= len(reason) <= 2000:
+        return await message.answer("Нужно от 15 до 2000 символов.")
+    await state.update_data(reason=reason)
+    await state.set_state(AppealForm.evidence)
+    await message.answer("Добавьте HTTPS-ссылку на подтверждающие материалы, доступные модератору. "
+                         "Не отправляйте чужие личные данные.", reply_markup=cancel_markup())
+
+
+@router.message(AppealForm.evidence)
+async def appeal_evidence(message: Message, state: FSMContext, bot: Bot):
+    try:
+        url = evidence_url(message.text or "")
+    except ValueError as exc:
+        return await message.answer(safe(exc))
+    data = await state.get_data()
+    async with Sessions() as s:
+        item = await s.get(Record, data["record_id"])
+        if not item or not item.active:
+            await state.clear()
+            return await message.answer("Запись уже отсутствует в публичной базе.")
+        daily = await count(s, Appeal, Appeal.author_id == message.from_user.id,
+                            Appeal.created_at >= datetime.now(timezone.utc)-timedelta(days=1))
+        if daily >= 3:
+            await state.clear()
+            return await message.answer("Лимит: 3 апелляции за 24 часа.")
+        if not await can_create_appeal(s, item.id, message.from_user.id):
+            await state.clear()
+            return await message.answer("У вас уже есть ожидающая апелляция на эту запись.")
+        item_appeal = Appeal(record_id=item.id, author_id=message.from_user.id,
+                             reason=data["reason"], evidence_url=url)
+        s.add(item_appeal)
+        await s.commit()
+        appeal_id = item_appeal.id
+    await state.clear()
+    await message.answer(f"✅ Апелляция #{appeal_id} передана модератору. "
+                         "Статус можно посмотреть через /myappeals.")
+    await notify_admins(bot, f"📝 <b>Новая апелляция #{appeal_id}</b>\n"
+                        f"На запись #{data['record_id']}\n"
+                        f"От: <code>{message.from_user.id}</code>\n"
+                        f"Причина: {safe(data['reason'][:800])}\n"
+                        f"Материалы: {safe(url)}",
+                        ik([("📝 Рассмотреть", f"admin:appeal:{appeal_id}:0")]))
+
+
+@router.message(Command("myappeals"))
+async def my_appeals(message: Message):
+    async with Sessions() as s:
+        appeals = list((await s.scalars(select(Appeal).where(
+            Appeal.author_id == message.from_user.id
+        ).order_by(Appeal.id.desc()).limit(10))).all())
+    if not appeals:
+        return await message.answer("Апелляций пока нет. Чтобы подать: /appeal")
+    statuses = {"pending": "⏳ На рассмотрении", "approved": "✅ Удовлетворена",
+                "rejected": "❌ Отклонена"}
+    await message.answer("📝 <b>Ваши апелляции</b>\n" + "\n".join(
+        f"#{a.id} · Запись #{a.record_id} · {statuses.get(a.status, safe(a.status))}"
+        for a in appeals))
+
+
+
 
 
 async def admin_catalog(message: Message, category: str, page: int = 0):
@@ -1368,6 +1484,7 @@ async def setup_commands(bot: Bot):
         BotCommand(command="report", description="Отправить жалобу"),
         BotCommand(command="deal", description="Предложить сделку"),
         BotCommand(command="appeal", description="Обжаловать запись"),
+        BotCommand(command="myappeals", description="Мои апелляции"),
         BotCommand(command="mydeals", description="Мои сделки"),
         BotCommand(command="searchgarant", description="Поиск гарантов"),
         BotCommand(command="myreports", description="Мои жалобы")
