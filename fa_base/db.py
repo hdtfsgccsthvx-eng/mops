@@ -61,6 +61,14 @@ class Report(Base):
     reviewed_by: Mapped[Optional[int]] = mapped_column(BigInteger)
 
 
+class ReportRecord(Base):
+    """Exact link between a moderated report and the public record it created."""
+    __tablename__ = "report_records"
+    report_id: Mapped[int] = mapped_column(Integer, ForeignKey("reports.id"), primary_key=True)
+    record_id: Mapped[int] = mapped_column(Integer, ForeignKey("records.id"), nullable=False, unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class Deal(Base):
     __tablename__ = "deals"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
