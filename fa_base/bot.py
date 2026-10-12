@@ -40,6 +40,10 @@ KIND = {"scam": "Подтверждённая запись о мошенниче
 ASSETS = ("Деньги", "MM2", "Адопт", "Робуксы", "Blade Ball", "Grow Garden", "Другое")
 
 
+class CheckForm(StatesGroup):
+    target = State()
+
+
 class ReportForm(StatesGroup):
     target = State()
     reason = State()
@@ -216,6 +220,7 @@ async def show_check(message: Message, requested: str | None, requested_id: int 
         target = f"i:{requested_id}" if requested_id is not None else f"u:{requested}"
         rows.append([("👍 Поддержать", f"vote:plus:{target}"),
                      ("👎 Предостеречь", f"vote:minus:{target}")])
+    rows.append([("🔎 Другая проверка", "check:start")])
     rows.append([("📝 Подать апелляцию", "appeal:start")])
     rows.append([("⚠️ Сообщить о мошенничестве", "report:start")])
     await send_cover(message, "check", "🔎 Результат проверки пользователя в FA база. Данные проверяйте самостоятельно.")
@@ -265,6 +270,8 @@ async def check_cmd(message: Message, command: CommandObject):
     if not subject:
         return await message.answer("Введите: <code>/check @username</code>, ID пользователя или ответьте командой на его сообщение.")
     if subject.isdigit():
+        if int(subject) <= 0:
+            return await message.answer("Нужен положительный Telegram ID.")
         return await show_check(message, None, int(subject))
     try:
         u = username(subject)
@@ -273,6 +280,37 @@ async def check_cmd(message: Message, command: CommandObject):
     async with Sessions() as s:
         user = await resolve_user(s, u)
     await show_check(message, u, user.id if user else None)
+
+
+@router.callback_query(F.data == "check:start")
+async def check_start_callback(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(CheckForm.target)
+    await call.answer()
+    await call.message.answer("🔎 Введите @username или Telegram ID.",
+                              reply_markup=cancel_markup())
+
+
+@router.message(CheckForm.target)
+async def check_input(message: Message, state: FSMContext):
+    raw = (message.text or "").strip()
+    if not raw:
+        return await message.answer("Введите @username или Telegram ID.")
+    if raw.isdecimal():
+        target_id = int(raw)
+        if target_id <= 0:
+            return await message.answer("Telegram ID должен быть положительным.")
+        target, known_id = None, target_id
+    else:
+        try:
+            target = username(raw)
+        except ValueError as exc:
+            return await message.answer(safe(exc))
+        async with Sessions() as s:
+            user = await resolve_user(s, target)
+            known_id = user.id if user else None
+    await state.clear()
+    return await show_check(message, target, known_id)
 
 
 @router.message(Command("me"))
@@ -1268,7 +1306,13 @@ async def text_menu(message: Message, state: FSMContext):
                                     "Выбирайте раздел кнопками ниже.",
                                     reply_markup=admin_menu())
     if message.text == "🔎 Проверить":
-        return await message.answer("Для проверки отправьте /check @username или /check ID.")
+        await state.clear()
+        await state.set_state(CheckForm.target)
+        return await message.answer(
+            "🔎 <b>Кого проверить?</b>\n"
+            "Пришлите @username или числовой Telegram ID.\n"
+            "Команда /check также продолжает работать.",
+            reply_markup=cancel_markup())
     if message.text == "👤 Мой профиль":
         return await me_cmd(message)
     if message.text == "💎 Гаранты":
