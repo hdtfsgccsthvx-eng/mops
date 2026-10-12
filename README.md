@@ -44,3 +44,22 @@ python -m fa_base.server
 ## Структура
 
 `fa_base/bot.py` — Telegram-команды и FSM; `fa_base/server.py` — веб-панель; `fa_base/db.py` — SQLAlchemy модели; `fa_base/config.py` — настройки; `fa_base/utils.py` — валидация; `fa_base/keyboards.py` — меню.
+## Текущая версия FA база
+
+- **Telegram:** @mops_garant_bot, владелец проекта: @mops_garant.
+- **Панель:** https://fa-baza-web-production.up.railway.app/admin
+- **Статус:** https://fa-baza-web-production.up.railway.app/health
+- **Инфраструктура:** Railway (fa-baza-web + Postgres), исходники в GitHub.
+- Оригинальные PNG-обложки формируются локально модулем `fa_base/branding.py`: приветствие, проверка, гаранты, жалобы, сделки и информация. Чужие иллюстрации не используются.
+- Новые команды: `/searchgarant слово`, `/mydeals`, `/myreports`, `/dealstatus ID`, `/canceldeal ID`.
+- Для модерации: `/finishdeal ID`, `/disputedeal ID`. В веб-админке доступны статусы сделки и обработка споров.
+- Ограничение: не больше 3 создаваемых сделок и 5 жалоб на один аккаунт за 24 часа.
+- Для уже установленного Telegram ID авторизация второй стороны сделки не зависит от смены username.
+- `/health` показывает готовность Telegram polling; `bot_ready: true` означает, что токен принят Telegram и процесс опроса запущен. Кратковременный Conflict при перевыкате возможен, пока Telegram завершает прежний опрос.
+- Быстрые модульные тесты: `python -m unittest discover -s tests -v`. Дополнительные интеграционные тесты панели требуют всех зависимостей из `requirements.txt` и пакета `httpx`.
+
+### Что требует настройки владельца
+
+Ссылки `CHANNEL_URL`, `GARANT_CHAT_URL`, `REPORT_URL`, `APPEAL_URL` сейчас ведут к профилю владельца, поскольку отдельные каналы и чаты не были предоставлены. Замените их в Railway на реальные ссылки сообщества и предложки.
+
+Проект не переводит деньги между пользователями и не даёт абсолютной гарантии безопасности. Отметки о нарушениях публикуются только после проверки модератором; ошибочные записи можно скрыть.
