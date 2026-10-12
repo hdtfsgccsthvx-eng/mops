@@ -904,7 +904,11 @@ async def add_garant_fee(message: Message, state: FSMContext):
         s.add(Audit(actor_id=message.from_user.id, action="add_garant", detail=d["handle"]))
         await s.commit()
     await state.clear()
-    await message.answer(f"✅ Гарант {mention(d['handle'])} сохранён.")
+    await message.answer(f"✅ Гарант {mention(d['handle'])} сохранён.\n"
+                         "Вы можете сразу добавить ещё одного или открыть список.",
+                         reply_markup=ik([("➕ Ещё гарант", "admin:newgarant")],
+                                         [("💎 Каталог", "admin:garants:0")],
+                                         [("⬅️ Админ-меню", "admin:home")]))
 
 
 @router.message(Command("delete_garant", "delete_record"))
@@ -971,7 +975,10 @@ async def record_evidence(message: Message, state: FSMContext):
         await s.commit()
         rid = r.id
     await state.clear()
-    await message.answer(f"✅ Запись #{rid} о {mention(d['target'])} добавлена.")
+    await message.answer(f"✅ Запись #{rid} о {mention(d['target'])} добавлена.",
+                         reply_markup=ik([("🔍 Открыть запись", f"admin:record:{rid}")],
+                                         [("➕ Ещё запись", "admin:newrecord:scam")],
+                                         [("⬅️ Админ-меню", "admin:home")]))
 
 
 def asset_markup(prefix: str):
