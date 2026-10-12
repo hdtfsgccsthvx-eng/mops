@@ -737,11 +737,13 @@ async def admin_callback(call: CallbackQuery, bot: Bot, state: FSMContext):
                       "records": "🗂 Записи базы", "deals": "🤝 Сделки",
                       "appeals": "📝 Апелляции"}
             model = models[task]
-            total = await count(s, model)
+            pending_only = task in ("reports", "appeals") and len(a) > 3 and a[3] == "pending"
+            filters = [model.status == "pending"] if pending_only else []
+            total = await count(s, model, *filters)
             pages = max(1, (total + 5 - 1)//5)
             page = min(page, pages-1)
-            rows = list((await s.scalars(select(model).order_by(model.id.desc())
-                                        .offset(page*5).limit(5))).all())
+            q = select(model).where(*filters).order_by(model.id.desc()).offset(page*5).limit(5)
+            rows = list((await s.scalars(q)).all())
             buttons = []
             for r in rows:
                 if task == "reports":
@@ -765,10 +767,16 @@ async def admin_callback(call: CallbackQuery, bot: Bot, state: FSMContext):
                 buttons.append([(label[:58], callback)])
             if page > 0 or page < pages-1:
                 nav = []
-                if page > 0: nav.append(("◀", f"admin:{task}:{page-1}"))
+                suffix = ":pending" if pending_only else ""
+                if page > 0: nav.append(("◀", f"admin:{task}:{page-1}{suffix}"))
                 nav.append((f"{page+1}/{pages}", "noop"))
-                if page < pages-1: nav.append(("▶", f"admin:{task}:{page+1}"))
+                if page < pages-1: nav.append(("▶", f"admin:{task}:{page+1}{suffix}"))
                 buttons.append(nav)
+            if task in ("reports", "appeals"):
+                if pending_only:
+                    buttons.append([("📋 Показать все", f"admin:{task}:0")])
+                else:
+                    buttons.append([("⏳ Только новые", f"admin:{task}:0:pending")])
             if task == "garants":
                 buttons.append([("➕ Добавить гаранта", "admin:newgarant")])
             if task == "records":
