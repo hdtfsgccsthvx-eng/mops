@@ -697,23 +697,53 @@ async def admin_callback(call: CallbackQuery, bot: Bot, state: FSMContext):
             buttons.append(back_admin(section,page))
             return await admin_render(call,text,ik(*buttons))
 
-        if task == "confirm" and len(a) == 5 and a[3].isdecimal():
-            typ, ident, page = a[2],int(a[3]),int(a[4]) if a[4].isdecimal() else 0
-            if typ not in ("g", "r") and not (typ.startswith("d") and typ[1:].isdecimal()):
-                return await call.message.answer("Неверное действие.")
-            if typ in ("g","r"):
+        if task == "confirm" and len(a) == 5:
+            if a[2] in ("g", "r") and a[3].isdecimal():
+                typ, ident, page = a[2], int(a[3]), int(a[4]) if a[4].isdecimal() else 0
                 model = Garant if typ == "g" else Record
-                r = await s.get(model,ident)
-                if not r: return await call.message.answer("Запись не найдена.")
+                r = await s.get(model, ident)
+                if not r:
+                    return await call.message.answer("Запись не найдена.")
                 section = "garant" if typ == "g" else "record"
                 message_text = f"Подтвердить изменение видимости #{ident}?"
                 actual = f"admin:toggle:{typ}:{ident}:{page}"
                 back = f"admin:{section}:{ident}:{page}"
+            elif a[2].startswith("d") and a[2][1:].isdecimal() and a[3] in ("done", "dispute"):
+                ident, operation = int(a[2][1:]), a[3]
+                page = int(a[4]) if a[4].isdecimal() else 0
+                d = await s.get(Deal, ident)
+                if not d or not can_finish_deal(d.status):
+                    return await call.message.answer("Сделка недоступна для изменения статуса.")
+                message_text = ("Завершить" if operation == "done" else "Открыть спор по") + f" сделке #{ident}?"
+                actual = f"admin:dstatus:{ident}:{operation}:{page}"
+                back = f"admin:deal:{ident}:{page}"
             else:
                 return await call.message.answer("Неверное действие.")
-            return await admin_render(call, "⚠️ <b>"+message_text+"</b>",
-                                      ik([("✅ Да, выполнить",actual)],
-                                         [("⬅️ Отмена",back)]))
+            return await admin_render(call, "⚠️ <b>" + message_text + "</b>",
+                                      ik([("✅ Да, выполнить", actual)],
+                                         [("⬅️ Отмена", back)]))
+
+        if task == "dstatus" and len(a) == 5 and a[2].isdecimal() and a[3] in ("done", "dispute"):
+            ident, operation = int(a[2]), a[3]
+            page = int(a[4]) if a[4].isdecimal() else 0
+            d = await s.get(Deal, ident)
+            if not d or not can_finish_deal(d.status):
+                return await call.message.answer("Сделка не найдена или уже завершена.")
+            d.status = "completed" if operation == "done" else "disputed"
+            s.add(Audit(actor_id=call.from_user.id, action="admin_deal",
+                        detail=f"#{ident}:{d.status}"))
+            participants = {d.creator_id, d.target_id}
+            await s.commit()
+            await admin_render(call, f"✅ Сделка #{ident}: {safe(deal_status_text(d.status))}",
+                               ik([("↩️ Открыть сделку",f"admin:deal:{ident}:{page}")],
+                                  back_admin()))
+            for uid in participants:
+                if uid:
+                    try:
+                        await bot.send_message(uid, f"Сделка #{ident}: {safe(deal_status_text(d.status))}")
+                    except Exception:
+                        pass
+            return
 
         if task == "toggle" and len(a) == 5 and a[3].isdecimal():
             typ,ident,page = a[2],int(a[3]),int(a[4]) if a[4].isdecimal() else 0
