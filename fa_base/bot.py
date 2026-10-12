@@ -199,6 +199,7 @@ async def show_check(message: Message, requested: str | None, requested_id: int 
                      ("👎 Предостеречь", f"vote:minus:{target}")])
     rows.append([("📝 Подать апелляцию", "appeal:start")])
     rows.append([("⚠️ Сообщить о мошенничестве", "report:start")])
+    await send_cover(message, "check", "🔎 Результат проверки пользователя в FA база. Данные проверяйте самостоятельно.")
     await message.answer(text[:3900], reply_markup=ik(*rows), disable_web_page_preview=True)
 
 
@@ -356,7 +357,7 @@ async def report_begin(event: Message | CallbackQuery, state: FSMContext):
     m = event.message if isinstance(event, CallbackQuery) else event
     if isinstance(event, CallbackQuery):
         await event.answer()
-    await m.answer("⚠️ <b>Сообщить о мошенничестве</b>\n\nВведите @username пользователя, на которого жалуетесь. Сведения сначала проверит модератор.", reply_markup=cancel_markup())
+    await send_cover(m, "report", "⚠️ <b>Сообщить о мошенничестве</b>\n\nВведите @username пользователя, на которого жалуетесь. Сведения сначала проверит модератор.", reply_markup=cancel_markup())
 
 
 @router.message(ReportForm.target)
@@ -628,7 +629,7 @@ async def deal_begin(message: Message, state: FSMContext, command: CommandObject
         await state.set_state(DealForm.offered)
         return await message.answer(f"🤝 Сделка с {mention(target)}\nЧто вы отдаёте?", reply_markup=asset_markup("deal:offered"))
     await state.set_state(DealForm.target)
-    await message.answer("🤝 <b>Новая сделка</b>\nВведите @username другой стороны:", reply_markup=cancel_markup())
+    await send_cover(message, "deal", "🤝 <b>Новая сделка</b>\nВведите @username другой стороны:", reply_markup=cancel_markup())
 
 
 @router.message(DealForm.target)
