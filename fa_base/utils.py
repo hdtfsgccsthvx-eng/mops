@@ -33,6 +33,16 @@ def mention(username: str) -> str:
     return f'<a href="https://t.me/{u}">@{safe(u)}</a>'
 
 
+def parse_telegram_id(raw: str) -> int:
+    value = raw.strip()
+    if not value.isdecimal() or len(value) > 19:
+        raise ValueError("Telegram ID должен быть положительным числом.")
+    number = int(value)
+    if not 1 <= number <= 9223372036854775807:
+        raise ValueError("Telegram ID вне допустимого диапазона.")
+    return number
+
+
 def parse_amount(raw: str) -> int:
     if not raw.strip().isdigit():
         raise ValueError("Введите сумму целым числом в рублях, например: 500")
