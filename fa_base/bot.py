@@ -125,7 +125,7 @@ async def menu(message: Message):
             f"👑 Владелец проекта: {mention(OWNER)}\n"
             "🔎 /check @username — поиск по базе\n👤 /me — мой профиль\n💎 /garants — гаранты\n🤝 /deal — предложить сделку")
     await send_cover(message, "welcome", text, reply_markup=home_links(cfg))
-    await message.answer("Выберите раздел в меню 👇", reply_markup=main_menu())
+    await message.answer("Выберите раздел в меню 👇", reply_markup=main_menu(is_admin(message.from_user.id)))
 
 
 @router.message(CommandStart())
@@ -1254,6 +1254,12 @@ async def search_garant(message: Message, command: CommandObject):
 
 @router.message(F.text)
 async def text_menu(message: Message, state: FSMContext):
+    if message.text == "🛠 Админ-панель":
+        if not is_admin(message.from_user.id):
+            return await message.answer("Нет доступа к админ-панели.")
+        return await message.answer("🛠 <b>FA база — управление</b>\n"
+                                    "Выбирайте раздел кнопками ниже.",
+                                    reply_markup=admin_menu())
     if message.text == "🔎 Проверить":
         return await message.answer("Для проверки отправьте /check @username или /check ID.")
     if message.text == "👤 Мой профиль":
