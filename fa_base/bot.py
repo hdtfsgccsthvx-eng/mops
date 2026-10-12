@@ -725,14 +725,17 @@ async def admin_callback(call: CallbackQuery, bot: Bot, state: FSMContext):
                 f"💎 Активных гарантов: {await count(s, Garant, Garant.active.is_(True))}\n"
                 f"🗂 Публичных записей: {await count(s, Record, Record.active.is_(True))}\n"
                 f"📨 Ожидающих жалоб: {await count(s, Report, Report.status == 'pending')}\n"
+                f"📝 Апелляций в очереди: {await count(s, Appeal, Appeal.status == 'pending')}\n"
                 f"🤝 Всего сделок: {await count(s, Deal)}")
             return await admin_render(call, content, ik(back_admin()))
 
-        if task in ("reports", "garants", "records", "deals"):
+        if task in ("reports", "garants", "records", "deals", "appeals"):
             page = min(max(0, int(a[2])) if len(a)>2 and a[2].isdecimal() else 0, 10000)
-            models = {"reports": Report, "garants": Garant, "records": Record, "deals": Deal}
+            models = {"reports": Report, "garants": Garant, "records": Record,
+                      "deals": Deal, "appeals": Appeal}
             titles = {"reports": "📨 Жалобы", "garants": "💎 Гаранты",
-                      "records": "🗂 Записи базы", "deals": "🤝 Сделки"}
+                      "records": "🗂 Записи базы", "deals": "🤝 Сделки",
+                      "appeals": "📝 Апелляции"}
             model = models[task]
             total = await count(s, model)
             pages = max(1, (total + 5 - 1)//5)
@@ -752,6 +755,10 @@ async def admin_callback(call: CallbackQuery, bot: Bot, state: FSMContext):
                 elif task == "records":
                     label = f"{'🔴' if r.active else '⚪'} #{r.id} @{r.username or r.telegram_id or 'ID'}"
                     callback = f"admin:record:{r.id}:{page}"
+                elif task == "appeals":
+                    icon = {"pending":"⏳", "approved":"✅", "rejected":"❌"}.get(r.status, "📝")
+                    label = f"{icon} Апелляция #{r.id} · Запись #{r.record_id}"
+                    callback = f"admin:appeal:{r.id}:{page}"
                 else:
                     label = f"🤝 #{r.id} @{r.target_username} · {deal_status_text(r.status)}"
                     callback = f"admin:deal:{r.id}:{page}"
@@ -771,6 +778,63 @@ async def admin_callback(call: CallbackQuery, bot: Bot, state: FSMContext):
             return await admin_render(
                 call, f"<b>{titles[task]}</b>\nВсего: {total}. Нажмите на запись для действий.",
                 ik(*buttons))
+
+        if task == "appeal" and len(a) >= 3 and a[2].isdecimal():
+            ap = await s.get(Appeal, int(a[2]))
+            if not ap:
+                return await call.message.answer("Апелляция не найдена.")
+            page = int(a[3]) if len(a)>3 and a[3].isdecimal() else 0
+            rec = await s.get(Record, ap.record_id)
+            desc = (f"📝 <b>Апелляция #{ap.id}</b> · {safe(ap.status)}\n"
+                    f"Запись: #{ap.record_id} ({'активна' if rec and rec.active else 'скрыта'})\n"
+                    f"Автор: <code>{ap.author_id}</code>\n"
+                    f"Причина: {safe(ap.reason)}\n"
+                    f"Материалы: {safe(ap.evidence_url)}\n")
+            buttons = []
+            if ap.status == "pending":
+                buttons.extend([
+                    [("✅ Удовлетворить", f"admin:appealdecision:{ap.id}:approve:{page}")],
+                    [("❌ Отклонить", f"admin:appealdecision:{ap.id}:reject:{page}")]
+                ])
+            buttons.append(back_admin("appeals", page))
+            return await admin_render(call, desc, ik(*buttons))
+
+        if task == "appealdecision" and len(a) == 5 and a[2].isdecimal() and a[3] in ("approve", "reject"):
+            ident, decision = int(a[2]), a[3]
+            page = int(a[4]) if a[4].isdecimal() else 0
+            ap = await s.get(Appeal, ident)
+            if not ap or ap.status != "pending":
+                return await call.message.answer("Апелляция уже рассмотрена.")
+            return await admin_render(call,
+                f"⚠️ <b>{'Удовлетворить' if decision == 'approve' else 'Отклонить'} "
+                f"апелляцию #{ident}?</b>\n"
+                "Удовлетворение скроет связанную запись.",
+                ik([("✅ Подтвердить", f"admin:applyappeal:{ident}:{decision}:{page}")],
+                   [("⬅️ Назад", f"admin:appeal:{ident}:{page}")]))
+
+        if task == "applyappeal" and len(a) == 5 and a[2].isdecimal() and a[3] in ("approve", "reject"):
+            ident, decision = int(a[2]), a[3]
+            page = int(a[4]) if a[4].isdecimal() else 0
+            try:
+                ap = await review_appeal(s, ident, decision == "approve", call.from_user.id)
+                await s.commit()
+                author_id, status, record_id = ap.author_id, ap.status, ap.record_id
+            except AppealError as exc:
+                await s.rollback()
+                return await call.message.answer("⚠️ " + safe(str(exc)))
+            await admin_render(call,
+                f"✅ Апелляция #{ident} · {safe(status)}\n"
+                f"Публичная запись #{record_id} "
+                + ("скрыта." if decision == "approve" else "оставлена без изменений."),
+                ik([("⬅️ Апелляции", f"admin:appeals:{page}")],
+                   back_admin()))
+            try:
+                await bot.send_message(author_id, f"📝 Ваша апелляция #{ident} "
+                    + ("удовлетворена, запись скрыта." if decision == "approve"
+                       else "отклонена модератором."))
+            except Exception:
+                pass
+            return
 
         if task == "report" and len(a) >= 3 and a[2].isdecimal():
             r = await s.get(Report, int(a[2]))
