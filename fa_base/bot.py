@@ -139,7 +139,10 @@ async def commands(message: Message):
                          "/start — главное меню\n/check @username — проверить пользователя\n"
                          "/me — проверить себя\n/info — о проекте\n/garants — каталог гарантов\n"
                          "/report — отправить жалобу\n/appeal — обжаловать запись\n"
-                         "/deal — создать предложение сделки\n/cancel — отменить заполнение" + extra)
+                         "/deal — создать предложение сделки\n/mydeals — история сделок\n"
+                         "/myreports — мои жалобы\n/searchgarant — поиск гаранта\n"
+                         "/dealstatus ID — статус сделки\n/canceldeal ID — отменить сделку\n"
+                         "/cancel — отменить заполнение" + extra)
 
 
 async def show_check(message: Message, requested: str | None, requested_id: int | None = None):
@@ -402,7 +405,7 @@ async def appeal(event: Message | CallbackQuery):
 async def admin(message: Message):
     if not is_admin(message.from_user.id):
         return await message.answer("Нет доступа к админ-панели.")
-    await message.answer("🛠 <b>FA база — админ-панель</b>\n\nКоманды: /add_garant, /add_sckam, /add_comn, /delete_record ID, /delete_garant ID, /binddeal ID (в группе).",
+    await message.answer("🛠 <b>FA база — админ-панель</b>\n\nКоманды: /add_garant, /add_sckam, /add_comn, /delete_record ID, /delete_garant ID, /binddeal ID (в группе), /finishdeal ID, /disputedeal ID.",
                          reply_markup=admin_menu())
 
 
@@ -762,6 +765,111 @@ async def bind_group(message: Message, command: CommandObject, bot: Bot):
         await message.answer("⚠️ Не удалось создать ссылку: дайте боту разрешение приглашать пользователей. Пригласите участников вручную.")
 
 
+
+@router.message(Command("mydeals"))
+async def my_deals(message: Message):
+    async with Sessions() as s:
+        rows = list((await s.scalars(select(Deal).where(
+            or_(Deal.creator_id == message.from_user.id, Deal.target_id == message.from_user.id))
+            .order_by(Deal.id.desc()).limit(12))).all())
+    if not rows:
+        return await message.answer("🤝 У вас пока нет сделок. Новая сделка: /deal")
+    lines = [f"#{d.id} · {safe(deal_status_text(d.status))} · {d.amount} ₽" for d in rows]
+    await message.answer("🤝 <b>Ваши сделки</b>\n\n" + "\n".join(lines) +
+                         "\n\nПодробнее: /dealstatus ID")
+
+
+@router.message(Command("myreports"))
+async def my_reports(message: Message):
+    async with Sessions() as s:
+        rows = list((await s.scalars(select(Report).where(Report.author_id == message.from_user.id)
+                    .order_by(Report.id.desc()).limit(12))).all())
+    if not rows:
+        return await message.answer("📨 У вас пока нет жалоб. Подать: /report")
+    await message.answer("📨 <b>Ваши жалобы</b>\n\n" + "\n".join(
+        f"#{r.id} · {safe(r.target_username)} · {safe(r.status)}" for r in rows))
+
+
+@router.message(Command("dealstatus"))
+async def deal_status(message: Message, command: CommandObject):
+    if not command.args or not command.args.strip().isdigit():
+        return await message.answer("Формат: /dealstatus ID")
+    async with Sessions() as s:
+        deal = await s.get(Deal, int(command.args.strip()))
+        if not deal or (not is_admin(message.from_user.id) and
+                        message.from_user.id not in (deal.creator_id, deal.target_id)):
+            return await message.answer("Сделка не найдена или доступ запрещён.")
+        status = deal_status_text(deal.status)
+        await message.answer(f"🤝 <b>Сделка #{deal.id}</b>\n\n"
+                             f"Статус: {safe(status)}\n"
+                             f"Контрагент: {mention(deal.target_username)}\n"
+                             f"Выдаётся: {safe(deal.offered)} · Получается: {safe(deal.requested)}\n"
+                             f"Сумма: {deal.amount} ₽")
+
+
+@router.message(Command("canceldeal"))
+async def cancel_deal(message: Message, command: CommandObject, bot: Bot):
+    if not command.args or not command.args.strip().isdigit():
+        return await message.answer("Формат: /canceldeal ID")
+    async with Sessions() as s:
+        deal = await s.get(Deal, int(command.args.strip()))
+        if not deal or deal.creator_id != message.from_user.id:
+            return await message.answer("Отменить можно только собственную сделку.")
+        if not can_cancel_deal(deal.status):
+            return await message.answer("На этом этапе отмену проводит администратор.")
+        deal.status = "cancelled"
+        target_id = deal.target_id
+        await s.commit()
+    await message.answer("✅ Сделка отменена.")
+    if target_id:
+        try:
+            await bot.send_message(target_id, "Вторая сторона отменила сделку.")
+        except Exception:
+            pass
+
+
+@router.message(Command("finishdeal", "disputedeal"))
+async def finish_deal(message: Message, command: CommandObject, bot: Bot):
+    if not is_admin(message.from_user.id):
+        return await message.answer("Нет прав модератора.")
+    if not command.args or not command.args.strip().isdigit():
+        return await message.answer("Формат: /finishdeal ID или /disputedeal ID")
+    status = "completed" if message.text.split()[0].split('@')[0] == "/finishdeal" else "disputed"
+    async with Sessions() as s:
+        deal = await s.get(Deal, int(command.args.strip()))
+        if not deal or not can_finish_deal(deal.status):
+            return await message.answer("Сделка недоступна для изменения статуса.")
+        deal.status = status
+        s.add(Audit(actor_id=message.from_user.id, action="deal_status", detail=f"{deal.id}:{status}"))
+        await s.commit()
+        audience = {deal.creator_id, deal.target_id}
+    result_text = f"Сделка #{deal.id}: {deal_status_text(status)}."
+    await message.answer("✅ " + result_text)
+    for uid in audience:
+        if not uid:
+            continue
+        try:
+            await bot.send_message(uid, result_text)
+        except Exception:
+            pass
+
+
+@router.message(Command("searchgarant"))
+async def search_garant(message: Message, command: CommandObject):
+    needle = (command.args or "").strip().removeprefix("@")[:50]
+    if len(needle) < 2:
+        return await message.answer("Пример: /searchgarant Serbia или /searchgarant nickname")
+    async with Sessions() as s:
+        found = list((await s.scalars(select(Garant).where(
+            Garant.active.is_(True), or_(Garant.username.ilike(f"%{needle}%"),
+                                           Garant.country.ilike(f"%{needle}%")))
+            .order_by(Garant.id.desc()).limit(15))).all())
+    if not found:
+        return await message.answer("По запросу ничего не найдено.")
+    lines = [f"💎 {mention(g.username)} · {safe(g.country)} · {safe(g.fee)}" for g in found]
+    await message.answer("<b>Результаты поиска гарантов</b>\n\n" + "\n".join(lines))
+
+
 @router.message(F.text)
 async def text_menu(message: Message, state: FSMContext):
     if message.text == "🔎 Проверить":
@@ -789,7 +897,10 @@ async def setup_commands(bot: Bot):
         BotCommand(command="garants", description="Каталог гарантов"),
         BotCommand(command="report", description="Отправить жалобу"),
         BotCommand(command="deal", description="Предложить сделку"),
-        BotCommand(command="appeal", description="Обжаловать запись")
+        BotCommand(command="appeal", description="Обжаловать запись"),
+        BotCommand(command="mydeals", description="Мои сделки"),
+        BotCommand(command="searchgarant", description="Поиск гарантов"),
+        BotCommand(command="myreports", description="Мои жалобы")
     ])
 
 
