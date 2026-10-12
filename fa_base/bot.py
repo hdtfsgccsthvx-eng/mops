@@ -15,7 +15,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (BotCommand, CallbackQuery, InlineKeyboardButton,
                            InlineKeyboardMarkup, Message, FSInputFile, InputProfilePhotoStatic)
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, text as sql_text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import Config
@@ -1378,6 +1378,29 @@ dispatcher = Dispatcher()
 dispatcher.include_router(router)
 
 
+async def ensure_bot_profile(bot: Bot):
+    """Change Telegram profile once, instead of hitting Bot API rate limits per deploy."""
+    version = "fa-profile-v2"
+    async with Sessions() as s:
+        already = await s.scalar(select(Audit.id).where(
+            Audit.action == "bot_profile_applied", Audit.detail == version).limit(1))
+    if already:
+        return
+    try:
+        await bot.set_my_name(name="FA база")
+        await bot.set_my_description(description=(
+            "FA база — проверка записей о пользователях, каталог гарантов, "
+            "жалобы на модерацию и согласование сделок. Владелец @mops_garant."))
+        await bot.set_my_short_description(short_description=(
+            "FA база: проверка аккаунтов, гаранты и сделки. Владелец @mops_garant."))
+    except Exception as exc:
+        log.warning("Telegram profile update deferred: %s", type(exc).__name__)
+        return
+    async with Sessions() as s:
+        s.add(Audit(actor_id=0, action="bot_profile_applied", detail=version))
+        await s.commit()
+
+
 async def run():
     global cfg, Sessions, BOT_NAME, BOT_READY, BOT_ERROR
     BOT_READY = False
@@ -1386,18 +1409,27 @@ async def run():
     engine, Sessions = build_db(cfg.database_url)
     await initialize(engine)
     bot = Bot(cfg.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    lock_connection = None
+    lock_id = 652304291
     try:
+        if engine.dialect.name == "postgresql":
+            lock_connection = await engine.connect()
+            waiting_notice = False
+            while True:
+                acquired = await lock_connection.scalar(
+                    sql_text("SELECT pg_try_advisory_lock(:lock_id)"),
+                    {"lock_id": lock_id})
+                await lock_connection.commit()
+                if acquired:
+                    break
+                if not waiting_notice:
+                    print("FA база: waiting for previous Telegram polling instance", flush=True)
+                    waiting_notice = True
+                await asyncio.sleep(3)
+
         me = await bot.get_me()
         BOT_NAME = me.username
-        try:
-            await bot.set_my_name(name="FA база")
-            await bot.set_my_description(description=(
-                "FA база — проверка записей о пользователях, каталог гарантов, "
-                "жалобы на модерацию и согласование безопасных сделок. Владелец @mops_garant."))
-            await bot.set_my_short_description(short_description=(
-                "FA база: проверка аккаунтов, гаранты и сделки. Владелец @mops_garant."))
-        except Exception as exc:
-            log.warning("Bot profile metadata not updated: %s", type(exc).__name__)
+        await ensure_bot_profile(bot)
         await ensure_bot_avatar(bot)
         await setup_commands(bot)
         BOT_READY = True
@@ -1409,6 +1441,16 @@ async def run():
         raise
     finally:
         BOT_READY = False
+        if lock_connection:
+            try:
+                await lock_connection.scalar(
+                    sql_text("SELECT pg_advisory_unlock(:lock_id)"),
+                    {"lock_id": lock_id})
+                await lock_connection.commit()
+            except Exception as exc:
+                log.warning("Postgres bot lock release: %s", type(exc).__name__)
+            finally:
+                await lock_connection.close()
         await bot.session.close()
         await engine.dispose()
 
