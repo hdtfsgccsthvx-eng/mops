@@ -61,7 +61,7 @@ def card_role(records, garant) -> str:
 
 def card_caption(*, name: str | None, telegram_id: int | None, records: list,
                  garant, positive: int, negative: int, checks: int,
-                 bot_username: str, checked_at: datetime | None = None):
+                 bot_username: str, checked_at: datetime | None = None, rating_url: str | None = None):
     """Return (safe Telegram photo caption <= 1024 chars, optional details message)."""
     checked_at = checked_at or datetime.now(timezone.utc)
     role = card_role(records, garant)
@@ -104,6 +104,12 @@ def card_caption(*, name: str | None, telegram_id: int | None, records: list,
         f"✅ <b>Проверено в @{html(bot_username.lstrip('@'))}</b>\n"
         f"🗓 <b>Дата проверки:</b> [{checked_at.astimezone(timezone.utc):%d.%m.%Y} UTC]"
     )
+    if telegram_id is None:
+        footer += "\n<i>ID неизвестен: ссылка по @username может измениться.</i>"
+    if rating_url:
+        link = safe_telegram_url(rating_url)
+        if link:
+            footer += f'\n⭐ <a href="{html(link)}">Оценить пользователя 👍 / 👎</a>'
     if len(lead) + len(footer) > 970:
         raise ValueError("Card headline too long to render safely")
     if details and len(lead) + len(details) + len(footer) <= 1024:

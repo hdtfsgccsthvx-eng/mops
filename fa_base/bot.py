@@ -28,6 +28,7 @@ from .utils import evidence_url, mention, parse_amount, parse_telegram_id, safe,
 from .branding import banner_path, avatar_path
 from .check_cards import card_caption, card_role, safe_telegram_url
 from .check_banners import check_banner_path
+from .check_reputation import check_link, rating_link, reputation_counts, persist_vote
 from .moderation import ModerationError, review_report
 from .appeals import AppealError, review_appeal, can_create_appeal
 
@@ -162,6 +163,20 @@ async def start(message: Message, command: CommandObject, state: FSMContext, bot
         async with Sessions() as s:
             found_user = await resolve_user(s, handle)
         return await show_check(message, handle, found_user.id if found_user else None)
+    if command.args and command.args.startswith("rate_i_"):
+        try:
+            target_id = parse_telegram_id(command.args[7:])
+        except ValueError:
+            return await message.answer("Неверная ссылка для оценки.")
+        return await show_rating_choice(message, None, target_id)
+    if command.args and command.args.startswith("rate_u_"):
+        try:
+            handle = username(command.args[7:])
+        except ValueError:
+            return await message.answer("Неверная ссылка для оценки.")
+        async with Sessions() as s:
+            known = await resolve_user(s, handle)
+        return await show_rating_choice(message, handle, known.id if known else None)
     if command.args and command.args.startswith("deal_"):
         try:
             deal_id = int(command.args[5:])
@@ -197,6 +212,10 @@ async def show_check(message: Message, requested: str | None, requested_id: int 
                              CheckEvent.at >= datetime.now(timezone.utc)-timedelta(minutes=1))
         if recent >= 20 and not is_admin(message.from_user.id):
             return await message.answer("Слишком много проверок. Подождите минуту и попробуйте снова.")
+        if requested_id is not None and not requested:
+            known_user = await s.get(User, requested_id)
+            if known_user is not None:
+                requested = known_user.username
         records = list((await s.scalars(select(Record).where(
             Record.active.is_(True),
             or_(Record.username == requested if requested else False,
@@ -208,15 +227,7 @@ async def show_check(message: Message, requested: str | None, requested_id: int 
         total_checks = await count(s, CheckEvent, or_(
             CheckEvent.subject_username == requested if requested else False,
             CheckEvent.subject_id == requested_id if requested_id else False))
-        key = f"id:{requested_id}" if requested_id is not None else f"username:{requested}"
-        positive = await count(s, ReputationVote,
-                               ReputationVote.subject_key == key, ReputationVote.score == 1)
-        negative = await count(s, ReputationVote,
-                               ReputationVote.subject_key == key, ReputationVote.score == -1)
-        if requested_id is not None:
-            user = await s.get(User, requested_id)
-            if user and not requested:
-                requested = user.username
+        positive, negative = await reputation_counts(s, requested, requested_id)
         garant = await s.scalar(select(Garant).where(
             Garant.active.is_(True), Garant.username == requested)) if requested else None
 
@@ -224,13 +235,10 @@ async def show_check(message: Message, requested: str | None, requested_id: int 
     caption, additional = card_caption(
         name=requested, telegram_id=requested_id, records=records,
         garant=garant, positive=positive, negative=negative,
-        checks=total_checks, bot_username=BOT_NAME)
+        checks=total_checks, bot_username=BOT_NAME,
+        rating_url=rating_link(BOT_NAME, requested, requested_id))
 
-    if requested_id is not None:
-        permanent = ("🛡 Вечная ссылка",
-                     f"url:https://t.me/{BOT_NAME}?start=check_{requested_id}")
-    else:
-        permanent = ("🛡 Вечная ссылка", "check:need_id")
+    permanent = ("🛡 Вечная ссылка", "url:" + check_link(BOT_NAME, requested, requested_id))
     projects = safe_telegram_url(cfg.channel_url) or "https://t.me/mops_garant"
     keyboard = ik(
         [permanent],
@@ -255,6 +263,31 @@ async def permanent_link_needs_id(call: CallbackQuery):
         show_alert=True)
 
 
+async def show_rating_choice(message: Message, requested: str | None, requested_id: int | None):
+    """The card keeps exactly three buttons; the clickable caption opens this rating menu."""
+    if requested_id is None and not requested:
+        return await message.answer("Пользователь не указан.")
+    async with Sessions() as s:
+        if requested_id is not None and not requested:
+            u = await s.get(User, requested_id)
+            if u is not None:
+                requested = u.username
+        positive, negative = await reputation_counts(s, requested, requested_id)
+    target = f"i:{requested_id}" if requested_id is not None else f"u:{requested}"
+    subject = f"@{safe(requested)}" if requested else f"ID <code>{requested_id}</code>"
+    await message.answer(
+        f"⭐ <b>Оценить пользователя {subject}</b>\n\n"
+        f"👍 Положительных оценок: {positive} | 👎 Предостережений: {negative}\n"
+        "<i>Оценки — мнения пользователей, а не подтверждённые факты. "
+        "Свой голос можно изменить.</i>",
+        reply_markup=ik(
+            [("👍 Поддержать", f"vote:plus:{target}"),
+             ("👎 Предостеречь", f"vote:minus:{target}")],
+            [("🔎 Проверить пользователя", "url:" + check_link(BOT_NAME, requested, requested_id))]
+        )
+    )
+
+
 @router.callback_query(F.data.startswith("vote:"))
 async def vote_callback(call: CallbackQuery):
     try:
@@ -263,28 +296,40 @@ async def vote_callback(call: CallbackQuery):
         if score is None or kind not in ("i", "u"):
             raise ValueError("Некорректная оценка")
         if kind == "i":
-            subject = parse_telegram_id(ident)
-            if subject == call.from_user.id:
-                return await call.answer("Нельзя оценивать себя", show_alert=True)
-            key = f"id:{subject}"
+            requested_id = parse_telegram_id(ident)
+            requested = None
         else:
-            subject = username(ident)
-            if subject == (call.from_user.username or "").lower():
-                return await call.answer("Нельзя оценивать себя", show_alert=True)
-            key = f"username:{subject}"
+            requested = username(ident)
+            requested_id = None
     except (ValueError, TypeError):
         return await call.answer("Неверные данные", show_alert=True)
-    async with Sessions() as s:
-        vote = await s.scalar(select(ReputationVote).where(
-            ReputationVote.voter_id == call.from_user.id,
-            ReputationVote.subject_key == key))
-        if vote:
-            vote.score = score
-        else:
-            s.add(ReputationVote(voter_id=call.from_user.id,
-                                 subject_key=key, score=score))
-        await s.commit()
-    await call.answer("✅ Оценка сохранена. Обновите проверку, чтобы увидеть результат.", show_alert=True)
+    try:
+        async with Sessions() as s:
+            if requested_id is not None:
+                known = await s.get(User, requested_id)
+                if known:
+                    requested = known.username
+            else:
+                known = await resolve_user(s, requested)
+                if known:
+                    requested_id = known.id
+            if requested == (call.from_user.username or "").lower() or requested_id == call.from_user.id:
+                return await call.answer("Нельзя оценивать себя", show_alert=True)
+            positive, negative = await persist_vote(
+                s, voter_id=call.from_user.id, score=score,
+                username=requested, telegram_id=requested_id)
+    except ValueError as exc:
+        return await call.answer(str(exc)[:180], show_alert=True)
+    await call.answer("✅ Оценка сохранена! Можно изменить её.", show_alert=False)
+    try:
+        await call.message.edit_text(
+            f"✅ <b>Ваша оценка сохранена!</b>\n\n"
+            f"👍 Положительных оценок: {positive} | 👎 Предостережений: {negative}\n"
+            "Нажмите другую оценку, чтобы изменить голос.\n\n"
+            "<i>Для обновлённого баннера откройте проверку заново.</i>",
+            reply_markup=call.message.reply_markup)
+    except Exception as exc:
+        log.debug("Vote result message cannot be edited: %s", type(exc).__name__)
 
 
 @router.message(Command("check"))
@@ -292,6 +337,10 @@ async def check_cmd(message: Message, command: CommandObject):
     subject = (command.args or "").strip()
     if message.reply_to_message and not subject:
         u = message.reply_to_message.from_user
+        if u is None:
+            return await message.answer("У этого сообщения нет доступного Telegram ID.")
+        async with Sessions() as s:
+            await touch_user(s, u)
         return await show_check(message, u.username.lower() if u.username else None, u.id)
     if not subject:
         return await message.answer("Введите: <code>/check @username</code>, ID пользователя или ответьте командой на его сообщение.")
