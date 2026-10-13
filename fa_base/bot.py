@@ -26,6 +26,8 @@ from .policies import (MAX_DEALS_PER_DAY, MAX_REPORTS_PER_DAY, identity_matches,
                        deal_status_text, can_cancel_deal, can_finish_deal)
 from .utils import evidence_url, mention, parse_amount, parse_telegram_id, safe, username
 from .branding import banner_path, avatar_path
+from .check_cards import card_caption, card_role, safe_telegram_url
+from .check_banners import check_banner_path
 from .moderation import ModerationError, review_report
 from .appeals import AppealError, review_appeal, can_create_appeal
 
@@ -188,62 +190,69 @@ async def commands(message: Message):
 
 
 async def show_check(message: Message, requested: str | None, requested_id: int | None = None):
+    """X-Scam-inspired photo card. Preserve existing reputation, search and moderation data."""
     async with Sessions() as s:
         recent = await count(s, CheckEvent,
                              CheckEvent.checker_id == message.from_user.id,
                              CheckEvent.at >= datetime.now(timezone.utc)-timedelta(minutes=1))
         if recent >= 20 and not is_admin(message.from_user.id):
             return await message.answer("Слишком много проверок. Подождите минуту и попробуйте снова.")
-        records = list((await s.scalars(select(Record).where(Record.active.is_(True), or_(Record.username == requested if requested else False,
-                                             Record.telegram_id == requested_id if requested_id else False)).order_by(Record.created_at.desc()))).all())
-        s.add(CheckEvent(checker_id=message.from_user.id, subject_username=requested, subject_id=requested_id))
+        records = list((await s.scalars(select(Record).where(
+            Record.active.is_(True),
+            or_(Record.username == requested if requested else False,
+                Record.telegram_id == requested_id if requested_id else False)
+        ).order_by(Record.created_at.desc()))).all())
+        s.add(CheckEvent(checker_id=message.from_user.id,
+                         subject_username=requested, subject_id=requested_id))
         await s.commit()
-        total_checks = await count(s, CheckEvent, or_(CheckEvent.subject_username == requested if requested else False,
-                                                     CheckEvent.subject_id == requested_id if requested_id else False))
+        total_checks = await count(s, CheckEvent, or_(
+            CheckEvent.subject_username == requested if requested else False,
+            CheckEvent.subject_id == requested_id if requested_id else False))
         key = f"id:{requested_id}" if requested_id is not None else f"username:{requested}"
-        positive = await count(s, ReputationVote, ReputationVote.subject_key == key, ReputationVote.score == 1)
-        negative = await count(s, ReputationVote, ReputationVote.subject_key == key, ReputationVote.score == -1)
+        positive = await count(s, ReputationVote,
+                               ReputationVote.subject_key == key, ReputationVote.score == 1)
+        negative = await count(s, ReputationVote,
+                               ReputationVote.subject_key == key, ReputationVote.score == -1)
         if requested_id is not None:
             user = await s.get(User, requested_id)
             if user and not requested:
                 requested = user.username
-    label = mention(requested) if requested else f"<code>{requested_id}</code>"
-    text = f"🔎 <b>Проверка FA база</b>\n\n👤 Пользователь: {label}\n"
-    if requested_id:
-        text += f"🆔 Telegram ID: <code>{requested_id}</code>\n"
-    if records:
-        text += "\n⚠️ <b>В базе есть проверенные модератором записи:</b>\n"
-        for r in records[:8]:
-            text += (f"\n• <b>#{r.id}: {KIND.get(r.kind, r.kind)}</b>\n"
-                     f"Причина: {safe(r.reason[:450])}\n"
-                     f"Доказательства: {safe(r.evidence_url[:500])}\n")
-        if len(records) > 8:
-            text += f"\nИ ещё {len(records)-8} записей."
+        garant = await s.scalar(select(Garant).where(
+            Garant.active.is_(True), Garant.username == requested)) if requested else None
+
+    role = card_role(records, garant)
+    caption, additional = card_caption(
+        name=requested, telegram_id=requested_id, records=records,
+        garant=garant, positive=positive, negative=negative,
+        checks=total_checks, bot_username=BOT_NAME)
+
+    if requested_id is not None:
+        permanent = ("🛡 Вечная ссылка",
+                     f"url:https://t.me/{BOT_NAME}?start=check_{requested_id}")
     else:
-        text += ("\n✅ <b>Активных записей не найдено.</b>\n"
-                 "Это не подтверждение надёжности пользователя. Проверяйте условия сделки самостоятельно.\n")
-    text += (f"\n👍 Положительных оценок: {positive} | 👎 Предостережений: {negative}"
-             "\n<i>Оценки — мнение пользователей, не подтверждённые факты.</i>")
-    text += f"\n🔍 Количество проверок: {total_checks}\n🗓 Проверено: {datetime.now(timezone.utc):%d.%m.%Y} (UTC)"
-    link = (f"https://t.me/{BOT_NAME}?start=check_{requested_id}" if requested_id
-            else f"https://t.me/{BOT_NAME}?start=checku_{requested}" if requested else "")
-    rows = []
-    if link:
-        rows.append([("🔗 " + ("Ссылка на Telegram ID" if requested_id else "Ссылка по username"), "url:" + link)])
-    if requested_id is not None or requested:
-        target = f"i:{requested_id}" if requested_id is not None else f"u:{requested}"
-        rows.append([("👍 Поддержать", f"vote:plus:{target}"),
-                     ("👎 Предостеречь", f"vote:minus:{target}")])
-    rows.append([("🔎 Другая проверка", "check:start")])
-    if records:
-        for record in records[:5]:
-            rows.append([(f"📝 Оспорить запись #{record.id}",
-                          f"appeal:record:{record.id}")])
-    else:
-        rows.append([("📝 Подать апелляцию", "appeal:start")])
-    rows.append([("⚠️ Сообщить о мошенничестве", "report:start")])
-    await send_cover(message, "check", "🔎 Результат проверки пользователя в FA база. Данные проверяйте самостоятельно.")
-    await message.answer(text[:3900], reply_markup=ik(*rows), disable_web_page_preview=True)
+        permanent = ("🛡 Вечная ссылка", "check:need_id")
+    projects = safe_telegram_url(cfg.channel_url) or "https://t.me/mops_garant"
+    keyboard = ik(
+        [permanent],
+        [("📂 Наши проекты", "url:" + projects)],
+        [("⚠️ Слить скамера Мопсу", "url:https://t.me/mops_garant")],
+    )
+    try:
+        await message.answer_photo(
+            FSInputFile(check_banner_path(role, positive + negative)),
+            caption=caption, reply_markup=keyboard)
+    except Exception as exc:
+        log.warning("Check card photo failed: %s", type(exc).__name__)
+        await message.answer(caption, reply_markup=keyboard, disable_web_page_preview=True)
+    if additional:
+        await message.answer(additional[:3900], disable_web_page_preview=True)
+
+
+@router.callback_query(F.data == "check:need_id")
+async def permanent_link_needs_id(call: CallbackQuery):
+    await call.answer(
+        "Telegram ID неизвестен. Укажите цифровой ID или ответьте командой /check на сообщение пользователя.",
+        show_alert=True)
 
 
 @router.callback_query(F.data.startswith("vote:"))
