@@ -117,6 +117,14 @@ class ReputationVote(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class ResolvedIdentity(Base):
+    """A Telegram-verified username-to-ID association, separate from bot members."""
+    __tablename__ = "resolved_identities"
+    username: Mapped[str] = mapped_column(String(40), primary_key=True)
+    telegram_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    verified_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class CheckEvent(Base):
     __tablename__ = "check_events"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)

@@ -29,6 +29,8 @@ from .branding import banner_path, avatar_path
 from .check_cards import card_caption, card_role, safe_telegram_url
 from .check_banners import check_banner_path
 from .check_reputation import check_link, rating_link, reputation_counts, persist_vote
+from .identity_lookup import identify_username, username_from_id, remember_identity
+from .telegram_resolver import shutdown_resolver
 from .moderation import ModerationError, review_report
 from .appeals import AppealError, review_appeal, can_create_appeal
 
@@ -160,9 +162,7 @@ async def start(message: Message, command: CommandObject, state: FSMContext, bot
             handle = username(command.args[7:])
         except ValueError:
             return await message.answer("Неверная ссылка на профиль.")
-        async with Sessions() as s:
-            found_user = await resolve_user(s, handle)
-        return await show_check(message, handle, found_user.id if found_user else None)
+        return await show_check(message, handle)
     if command.args and command.args.startswith("rate_i_"):
         try:
             target_id = parse_telegram_id(command.args[7:])
@@ -174,9 +174,7 @@ async def start(message: Message, command: CommandObject, state: FSMContext, bot
             handle = username(command.args[7:])
         except ValueError:
             return await message.answer("Неверная ссылка для оценки.")
-        async with Sessions() as s:
-            known = await resolve_user(s, handle)
-        return await show_rating_choice(message, handle, known.id if known else None)
+        return await show_rating_choice(message, handle, None)
     if command.args and command.args.startswith("deal_"):
         try:
             deal_id = int(command.args[5:])
@@ -206,6 +204,9 @@ async def commands(message: Message):
 
 async def show_check(message: Message, requested: str | None, requested_id: int | None = None):
     """X-Scam-inspired photo card. Preserve existing reputation, search and moderation data."""
+    if requested and requested_id is None:
+        async with Sessions() as lookup_session:
+            requested_id = await identify_username(lookup_session, requested)
     async with Sessions() as s:
         recent = await count(s, CheckEvent,
                              CheckEvent.checker_id == message.from_user.id,
@@ -213,9 +214,7 @@ async def show_check(message: Message, requested: str | None, requested_id: int 
         if recent >= 20 and not is_admin(message.from_user.id):
             return await message.answer("Слишком много проверок. Подождите минуту и попробуйте снова.")
         if requested_id is not None and not requested:
-            known_user = await s.get(User, requested_id)
-            if known_user is not None:
-                requested = known_user.username
+            requested = await username_from_id(s, requested_id)
         records = list((await s.scalars(select(Record).where(
             Record.active.is_(True),
             or_(Record.username == requested if requested else False,
@@ -268,10 +267,10 @@ async def show_rating_choice(message: Message, requested: str | None, requested_
     if requested_id is None and not requested:
         return await message.answer("Пользователь не указан.")
     async with Sessions() as s:
+        if requested and requested_id is None:
+            requested_id = await identify_username(s, requested)
         if requested_id is not None and not requested:
-            u = await s.get(User, requested_id)
-            if u is not None:
-                requested = u.username
+            requested = await username_from_id(s, requested_id)
         positive, negative = await reputation_counts(s, requested, requested_id)
     target = f"i:{requested_id}" if requested_id is not None else f"u:{requested}"
     subject = f"@{safe(requested)}" if requested else f"ID <code>{requested_id}</code>"
@@ -306,13 +305,9 @@ async def vote_callback(call: CallbackQuery):
     try:
         async with Sessions() as s:
             if requested_id is not None:
-                known = await s.get(User, requested_id)
-                if known:
-                    requested = known.username
+                requested = await username_from_id(s, requested_id)
             else:
-                known = await resolve_user(s, requested)
-                if known:
-                    requested_id = known.id
+                requested_id = await identify_username(s, requested)
             if requested == (call.from_user.username or "").lower() or requested_id == call.from_user.id:
                 return await call.answer("Нельзя оценивать себя", show_alert=True)
             positive, negative = await persist_vote(
@@ -341,6 +336,7 @@ async def check_cmd(message: Message, command: CommandObject):
             return await message.answer("У этого сообщения нет доступного Telegram ID.")
         async with Sessions() as s:
             await touch_user(s, u)
+            await remember_identity(s, u.username, u.id)
         return await show_check(message, u.username.lower() if u.username else None, u.id)
     if not subject:
         return await message.answer("Введите: <code>/check @username</code>, ID пользователя или ответьте командой на его сообщение.")
@@ -354,9 +350,7 @@ async def check_cmd(message: Message, command: CommandObject):
         u = username(subject)
     except ValueError as ex:
         return await message.answer(safe(ex))
-    async with Sessions() as s:
-        user = await resolve_user(s, u)
-    await show_check(message, u, user.id if user else None)
+    await show_check(message, u)
 
 
 @router.callback_query(F.data == "check:start")
@@ -384,9 +378,7 @@ async def check_input(message: Message, state: FSMContext):
             target = username(raw)
         except ValueError as exc:
             return await message.answer(safe(exc))
-        async with Sessions() as s:
-            user = await resolve_user(s, target)
-            known_id = user.id if user else None
+        known_id = None
     await state.clear()
     return await show_check(message, target, known_id)
 
@@ -1704,6 +1696,7 @@ async def run():
                 log.warning("Postgres bot lock release: %s", type(exc).__name__)
             finally:
                 await lock_connection.close()
+        await shutdown_resolver()
         await bot.session.close()
         await engine.dispose()
 
