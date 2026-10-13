@@ -31,6 +31,11 @@ from .check_banners import check_banner_path
 from .check_reputation import check_link, rating_link, reputation_counts, persist_vote
 from .identity_lookup import identify_username, username_from_id, remember_identity
 from .telegram_resolver import shutdown_resolver
+from .payment_watch import (start_watch, watch_loop, get_watch, public_status,
+                            subscribe as subscribe_payment_watch,
+                            unsubscribe as unsubscribe_payment_watch,
+                            confirm_watch, configured as payment_watch_configured,
+                            can_start_deal)
 from .moderation import ModerationError, review_report
 from .appeals import AppealError, review_appeal, can_create_appeal
 
@@ -184,6 +189,69 @@ async def start(message: Message, command: CommandObject, state: FSMContext, bot
     await menu(message)
 
 
+@router.message(Command("payment_status"))
+async def payment_status_cmd(message: Message):
+    async with Sessions() as s:
+        status = public_status(await get_watch(s))
+    await message.answer(
+        "📋 <b>Статус административного подтверждения оплаты</b>\n\n"
+        + safe(status) + "\n\n"
+        "Это самостоятельная отметка администратора, не банковская проверка "
+        "и не оценка надёжности конкретного пользователя.\n\n"
+        "Подписаться на изменения: /payment_alerts")
+
+
+@router.message(Command("payment_alerts"))
+async def payment_subscribe_cmd(message: Message):
+    if message.chat.type != "private":
+        return await message.answer("Подписка доступна только в личном чате с ботом.")
+    async with Sessions() as s:
+        result = await subscribe_payment_watch(s, message.from_user.id)
+        status = public_status(await get_watch(s))
+    if result == "off":
+        return await message.answer("Мониторинг подтверждения пока не активирован.")
+    await message.answer(
+        "🔔 Вы подписаны на изменения статуса подтверждения оплаты.\n\n"
+        + safe(status) + "\n\n"
+        "Уведомление придёт только при просрочке; если подтверждение поступит "
+        "позже, отправлю исправление. Отписаться: /payment_alerts_off")
+
+
+@router.message(Command("payment_alerts_off"))
+async def payment_unsubscribe_cmd(message: Message):
+    async with Sessions() as s:
+        await unsubscribe_payment_watch(s, message.from_user.id)
+    await message.answer("🔕 Вы отписаны от уведомлений об оплате.")
+
+
+@router.message(Command("payment_confirm"))
+async def payment_confirm_cmd(message: Message, command: CommandObject):
+    """Admin-only, private secret command; never echo or log the supplied code."""
+    if message.chat.type != "private" or not is_admin(message.from_user.id):
+        return await message.answer("Команда недоступна.")
+    if not payment_watch_configured():
+        return await message.answer("Подтверждение оплаты не настроено.")
+    # Delete sensitive command from chat history, if Telegram allows it.
+    candidate = (command.args or "").strip()
+    if candidate:
+        try:
+            await message.delete()
+        except Exception:
+            log.debug("Cannot delete private payment confirmation command")
+    if not candidate:
+        return await message.answer("Введите секретный код после /payment_confirm.")
+    async with Sessions() as s:
+        try:
+            result = await confirm_watch(s, message.from_user.id, candidate)
+        except ValueError:
+            return await message.answer("Код неверный либо мониторинг не активирован.")
+    await message.answer(
+        "✅ Отметка о подтверждении оплаты сохранена"
+        + (" (после срока)." if result == "confirmed_late" else " (в срок).")
+        + "\nПодписчики, получившие предупреждение о просрочке, "
+          "получат уведомление об изменении статуса.")
+
+
 @router.message(Command("id"))
 async def own_id(message: Message):
     await message.answer(f"Ваш Telegram ID: <code>{message.from_user.id}</code>")
@@ -194,7 +262,9 @@ async def commands(message: Message):
     extra = "\n🔧 /admin, /add_garant, /add_sckam, /add_comn, /binddeal ID — для администраторов" if is_admin(message.from_user.id) else ""
     await message.answer("📋 <b>Команды FA база</b>\n\n"
                          "/start — главное меню\n/check @username — проверить пользователя\n"
-                         "/me — проверить себя\n/info — о проекте\n/garants — каталог гарантов\n"
+                         "/me — проверить себя\n/info — о проекте\n"
+                         "/payment_status — статус оплаты\n/payment_alerts — подписка на изменения\n"
+                         "/payment_alerts_off — отписаться\n/garants — каталог гарантов\n"
                          "/report — отправить жалобу\n/appeal — обжаловать запись\n"
                          "/deal — создать предложение сделки\n/mydeals — история сделок\n"
                          "/myreports — мои жалобы\n/searchgarant — поиск гаранта\n"
@@ -238,6 +308,15 @@ async def show_check(message: Message, requested: str | None, requested_id: int 
         rating_url=rating_link(BOT_NAME, requested, requested_id))
 
     permanent = ("🛡 Вечная ссылка", "url:" + check_link(BOT_NAME, requested, requested_id))
+    if (requested or "").lower() == "mops_garant":
+        async with Sessions() as s:
+            watch = await get_watch(s)
+        if watch is not None and payment_watch_configured():
+            extra_status = "\n\n" + safe(public_status(watch))
+            if len(caption) + len(extra_status) <= 1024:
+                caption += extra_status
+            else:
+                additional = (additional or "") + extra_status
     projects = safe_telegram_url(cfg.channel_url) or "https://t.me/mops_garant"
     keyboard = ik(
         [permanent],
@@ -397,6 +476,8 @@ async def info_cmd(message: Message):
         suspicious = await count(s, Record, Record.kind == "suspicious", Record.active.is_(True))
         garants = await count(s, Garant, Garant.active.is_(True))
         reports = await count(s, Report, Report.status == "pending")
+    async with Sessions() as s:
+        payment_info = public_status(await get_watch(s))
     await send_cover(message, "info", "ℹ️ <b>FA база</b>\n\n"
                          "Реестр модерируемых сообщений о рисках при обменах игровыми ценностями.\n\n"
                          f"📌 Подтверждённых записей: {scammers}\n"
@@ -404,6 +485,7 @@ async def info_cmd(message: Message):
                          f"💎 Гарантов: {garants}\n"
                          f"📨 Жалоб на рассмотрении: {reports}\n\n"
                          f"👑 Владелец: {mention(OWNER)}\n\n"
+                         f"📋 Статус оплаты: {safe(payment_info)}\n\n"
                          "Записи не заменяют независимую проверку и не служат гарантией сделки.",
                          reply_markup=home_links(cfg))
 
@@ -1282,6 +1364,8 @@ def asset_markup(prefix: str):
 async def deal_begin(message: Message, state: FSMContext, command: CommandObject):
     await state.clear()
     async with Sessions() as s:
+        if not await can_start_deal(s):
+            return await message.answer("⏸ Новые сделки временно приостановлены: ожидается подтверждение оплаты администратором. /payment_status")
         today = await count(s, Deal, Deal.creator_id == message.from_user.id,
                             Deal.created_at >= datetime.now(timezone.utc)-timedelta(days=1))
     if today >= MAX_DEALS_PER_DAY:
@@ -1343,6 +1427,9 @@ async def deal_amount(message: Message, state: FSMContext):
         return await message.answer(safe(ex))
     d = await state.get_data()
     async with Sessions() as s:
+        if not await can_start_deal(s):
+            await state.clear()
+            return await message.answer("⏸ Новые сделки приостановлены до подтверждения оплаты администратором. /payment_status")
         today = await count(s, Deal, Deal.creator_id == message.from_user.id,
                             Deal.created_at >= datetime.now(timezone.utc)-timedelta(days=1))
         if today >= MAX_DEALS_PER_DAY:
@@ -1615,7 +1702,9 @@ async def setup_commands(bot: Bot):
         BotCommand(command="myappeals", description="Мои апелляции"),
         BotCommand(command="mydeals", description="Мои сделки"),
         BotCommand(command="searchgarant", description="Поиск гарантов"),
-        BotCommand(command="myreports", description="Мои жалобы")
+        BotCommand(command="myreports", description="Мои жалобы"),
+        BotCommand(command="payment_status", description="Статус подтверждения оплаты"),
+        BotCommand(command="payment_alerts", description="Подписка на изменения оплаты")
     ])
 
 
@@ -1655,6 +1744,7 @@ async def run():
     await initialize(engine)
     bot = Bot(cfg.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     lock_connection = None
+    payment_watch_task = None
     lock_id = 652304291
     try:
         if engine.dialect.name == "postgresql":
@@ -1677,6 +1767,13 @@ async def run():
         await ensure_bot_profile(bot)
         await ensure_bot_avatar(bot)
         await setup_commands(bot)
+        async with Sessions() as s:
+            newly_started = await start_watch(s)
+            if newly_started:
+                deadline = public_status(await get_watch(s))
+                await notify_admins(bot, "🔐 Мониторинг оплаты на 48 часов запущен.\n" + deadline + "\nПодтвердите оплату командой /payment_confirm с секретным кодом в личном чате.")
+        if payment_watch_configured():
+            payment_watch_task = asyncio.create_task(watch_loop(Sessions, bot))
         BOT_READY = True
         print(f"FA база: Telegram bot @{BOT_NAME} ready for polling", flush=True)
         await dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types())
@@ -1686,6 +1783,9 @@ async def run():
         raise
     finally:
         BOT_READY = False
+        if payment_watch_task is not None:
+            payment_watch_task.cancel()
+            await asyncio.gather(payment_watch_task, return_exceptions=True)
         if lock_connection:
             try:
                 await lock_connection.scalar(
