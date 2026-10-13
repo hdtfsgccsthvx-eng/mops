@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from fa_base.db import Base
 from fa_base.payment_watch import (
     PaymentWatch, PaymentSubscriber, DURATION, start_watch, get_watch,
-    status_at, expire_watch, confirm_watch, public_status,
+    status_at, expire_watch, confirm_watch, public_status, aware,
     subscribe, unsubscribe, send_pending_notifications, can_start_deal,
 )
 
@@ -38,7 +38,7 @@ class PaymentWatchTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await start_watch(s, self.now))
             self.assertFalse(await start_watch(s, self.now + timedelta(hours=10)))
             gate = await get_watch(s)
-            self.assertEqual(gate.deadline_at, self.now + DURATION)
+            self.assertEqual(aware(gate.deadline_at), self.now + DURATION)
             self.assertEqual(status_at(gate, self.now + timedelta(hours=47)), "pending")
             self.assertEqual(status_at(gate, self.now + DURATION), "overdue")
             self.assertTrue(await can_start_deal(s, self.now + timedelta(hours=47)))
