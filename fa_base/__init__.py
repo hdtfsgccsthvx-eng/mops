@@ -1,1 +1,0 @@
-"""FA база — Telegram trust directory and moderated deal workflow."""
